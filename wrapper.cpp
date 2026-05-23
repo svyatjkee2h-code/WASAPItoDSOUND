@@ -1251,7 +1251,7 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     if (bufferFrames == 0) return AUDCLNT_E_BUFFER_SIZE_ERROR;
     if (flow == eRender && !isLoopback) {
         UINT32 minFrames = (lowLatencyShared && periodFrames > 0) ? (periodFrames * 8) : 2048U;
-        bufferFrames = std::max({ bufferFrames * 2, minFrames, 4096U });
+        bufferFrames = std::max({ bufferFrames * 4, minFrames, 4096U });
     }
 
     bufferBytes = bufferFrames * blockAlign;
