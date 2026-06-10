@@ -1,4 +1,3 @@
-//wrapper.cpp
 #include <initguid.h>
 #include <algorithm>
 #include <cmath>
@@ -42,7 +41,8 @@ static bool IsBlacklistApp()
 
     return (wcscmp(pName, L"consolcu.exe") == 0) ||
         (wcscmp(pName, L"ctaudcs.exe") == 0) ||
-	(wcscmp(pName, L"spkconsl.exe") == 0);
+        (wcscmp(pName, L"mypal.exe") == 0) ||
+        (wcscmp(pName, L"spkconsl.exe") == 0);
 }
 
 using std::vector;
@@ -267,7 +267,7 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
         return;
     }
 
-//null all other channels
+    //null all other channels
     memset(dest, 0, destFrames * destChannels * sizeof(float));
 }
 
@@ -1282,8 +1282,16 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     bufferFrames = static_cast<UINT32>(((bufferDuration * static_cast<REFERENCE_TIME>(rate)) + 5000000LL) / 10000000LL);
     if (bufferFrames == 0) return AUDCLNT_E_BUFFER_SIZE_ERROR;
     if (flow == eRender && !isLoopback) {
-        UINT32 minFrames = (lowLatencyShared && periodFrames > 0) ? (periodFrames * 8) : 2048U;
-        bufferFrames = std::max({ bufferFrames * 4, minFrames, 4096U });
+        if (lowLatencyShared && periodFrames > 0) {
+            //Creating buffer equal to a period
+            if (bufferFrames < periodFrames * 2) bufferFrames = periodFrames * 2;
+            else if (bufferFrames > periodFrames * 4) bufferFrames = periodFrames * 4;
+        }
+        else {
+            //standart logic to other modes
+            UINT32 minFrames = 2048U;
+            bufferFrames = std::max({ bufferFrames * 4, minFrames, 4096U });
+        }
     }
 
     bufferBytes = bufferFrames * blockAlign;
@@ -1526,27 +1534,30 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
     if (flow == eRender)
     {
         UINT32 writePosBytes = static_cast<UINT32>(lastPos % bufferBytes);
-        UINT32 queuedBytes = (writePosBytes >= curPos)
+
+        UINT32 queuedBytes =
+            (writePosBytes >= curPos)
             ? (writePosBytes - curPos)
             : (bufferBytes - curPos + writePosBytes);
 
         currentPaddingFrames = queuedBytes / blockAlign;
+
         if (currentPaddingFrames > bufferFrames)
             currentPaddingFrames = bufferFrames;
 
-        if (currentPaddingFrames > totalWrittenFrames)
-            currentPaddingFrames = static_cast<UINT32>(totalWrittenFrames > bufferFrames ? bufferFrames : totalWrittenFrames);
-    }
-    else
-    {
-        UINT32 readPosBytes = static_cast<UINT32>(lastPos % bufferBytes);
-        UINT32 availableBytes = (curPos >= readPosBytes)
-            ? (curPos - readPosBytes)
-            : (bufferBytes - readPosBytes + curPos);
+        UINT64 playedFrames = devicePositionFrames;
 
-        currentPaddingFrames = availableBytes / blockAlign;
-        if (currentPaddingFrames > bufferFrames)
-            currentPaddingFrames = bufferFrames;
+        if (totalWrittenFrames > playedFrames)
+        {
+            UINT64 remaining = totalWrittenFrames - playedFrames;
+
+            if (remaining < currentPaddingFrames)
+                currentPaddingFrames = static_cast<UINT32>(remaining);
+        }
+        else
+        {
+            currentPaddingFrames = 0;
+        }
     }
 
     *padding = currentPaddingFrames;
