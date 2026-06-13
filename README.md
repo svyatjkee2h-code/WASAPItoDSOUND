@@ -1,6 +1,6 @@
 This project is aimed to bring WASAPI layer support to previous Windows versions such like XP and 2003 converting WASAPI calls to DirectSound.
 
-For now this current release version 1.0.0.7 works ONLY with KernelEx for Win2k by BlackWingcat and on Windows XP/2003 with One-Core-API extensions.
+For now this current release version 1.0.0.8 works ONLY with KernelEx for Win2k by BlackWingcat and on Windows XP/2003 with One-Core-API extensions.
 
 DO NOT TRY TO USE ON Windows VISTA and higher you will break your sound completely!
 
