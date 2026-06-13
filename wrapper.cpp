@@ -737,8 +737,8 @@ HRESULT __stdcall MyDeviceEnumerator::UnregisterEndpointNotificationCallback(IMM
     if (pClient == NULL) return E_POINTER;
     auto it = std::find(clients.begin(), clients.end(), pClient);
     if (it == clients.end()) return S_OK;
-    (*it)->Release();
     clients.erase(it);
+    (*it)->Release();
     return S_OK;
 }
 
@@ -785,19 +785,31 @@ void MyDeviceEnumerator::FeedLoopback(const BYTE* pData, UINT32 numFrames, const
 
     EnterCriticalSection(&loopCS);
 
-    if (loopPaddingFrames > 100000) {
-        loopReadPos = loopWritePos;
-        loopPaddingFrames = 0;
+    if (loopFormat.Format.nSamplesPerSec == 0 ||
+        loopFormat.Format.nBlockAlign == 0 ||
+        loopBytes == 0)
+    {
+        LeaveCriticalSection(&loopCS);
+        return;
     }
 
     UINT32 srcChannels = srcFmt.Format.nChannels;
     UINT32 srcRate = srcFmt.Format.nSamplesPerSec;
     UINT32 loopRate = loopFormat.Format.nSamplesPerSec;
     UINT32 loopChannels = loopFormat.Format.nChannels;
+    UINT32 loopBlockAlign = loopFormat.Format.nBlockAlign;
+
+    const UINT64 loopCapacityFrames = loopBytes / loopBlockAlign;
+    if (loopCapacityFrames == 0)
+    {
+        LeaveCriticalSection(&loopCS);
+        return;
+    }
 
     double ratio = static_cast<double>(loopRate) / srcRate;
     UINT32 destFrames = static_cast<UINT32>(static_cast<double>(numFrames) * ratio + 0.5);
-    if (destFrames == 0) {
+    if (destFrames == 0)
+    {
         LeaveCriticalSection(&loopCS);
         return;
     }
@@ -812,11 +824,13 @@ void MyDeviceEnumerator::FeedLoopback(const BYTE* pData, UINT32 numFrames, const
     BYTE* writeData = nullptr;
     vector<BYTE> tempWrite;
 
-    if (formatsMatch) {
-        bytesToWrite = numFrames * loopFormat.Format.nBlockAlign;
+    if (formatsMatch)
+    {
+        bytesToWrite = numFrames * loopBlockAlign;
         writeData = const_cast<BYTE*>(pData);
     }
-    else {
+    else
+    {
         UINT32 srcSamples = numFrames * srcChannels;
         vector<float> fSrc(srcSamples);
         ConvertToFloat(pData, srcFmt, fSrc.data(), numFrames);
@@ -832,22 +846,26 @@ void MyDeviceEnumerator::FeedLoopback(const BYTE* pData, UINT32 numFrames, const
         writeData = tempWrite.data();
     }
 
-    UINT64 spaceBytes = (loopReadPos - loopWritePos + loopBytes) % loopBytes;
-    if (bytesToWrite > spaceBytes) {
-        loopReadPos += bytesToWrite - spaceBytes;
+    UINT64 addedFrames = formatsMatch ? static_cast<UINT64>(numFrames) : static_cast<UINT64>(destFrames);
+    UINT64 newPadding = static_cast<UINT64>(loopPaddingFrames) + addedFrames;
+
+    if (newPadding > loopCapacityFrames)
+    {
+        UINT64 overflowFrames = newPadding - loopCapacityFrames;
+        loopReadPos += overflowFrames * loopBlockAlign;
+        newPadding = loopCapacityFrames;
     }
 
     UINT32 pos = static_cast<UINT32>(loopWritePos % loopBytes);
     UINT32 bytes1 = std::min(bytesToWrite, loopBytes - pos);
     memcpy(loopBuf + pos, writeData, bytes1);
-    if (bytes1 < bytesToWrite) {
+    if (bytes1 < bytesToWrite)
+    {
         memcpy(loopBuf, writeData + bytes1, bytesToWrite - bytes1);
     }
 
     loopWritePos += bytesToWrite;
-
-    UINT32 addedFrames = formatsMatch ? numFrames : destFrames;
-    loopPaddingFrames += addedFrames;
+    loopPaddingFrames = static_cast<UINT32>(newPadding);
     loopPositionFrames += addedFrames;
 
     SetEvent(loopEvent);
@@ -1432,31 +1450,61 @@ HRESULT __stdcall MyAudioClient::GetStreamLatency(REFERENCE_TIME* phnsLatency) {
     return S_OK;
 }
 
-HRESULT __stdcall MyAudioClient::GetCurrentPadding(UINT32* pNumPaddingFrames) {
+HRESULT __stdcall MyAudioClient::GetCurrentPadding(UINT32* pNumPaddingFrames)
+{
     if (pNumPaddingFrames == NULL) return E_POINTER;
 
-    if (rate == 0) {
+    if (rate == 0)
+    {
         *pNumPaddingFrames = 0;
         return S_OK;
     }
 
     if (isLoopback)
     {
-        if (g_enumerator == nullptr) {
+        if (g_enumerator == nullptr)
+        {
             *pNumPaddingFrames = 0;
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
+
         EnterCriticalSection(&g_enumerator->loopCS);
-        double ratio = (double)rate / g_enumerator->loopFormat.Format.nSamplesPerSec;
-        *pNumPaddingFrames = static_cast<UINT32>(g_enumerator->loopPaddingFrames * ratio + 0.5);
+
+        if (g_enumerator->loopBuf == nullptr ||
+            g_enumerator->loopBytes == 0 ||
+            g_enumerator->loopFormat.Format.nSamplesPerSec == 0 ||
+            g_enumerator->loopFormat.Format.nBlockAlign == 0)
+        {
+            LeaveCriticalSection(&g_enumerator->loopCS);
+            *pNumPaddingFrames = 0;
+            return AUDCLNT_E_DEVICE_INVALIDATED;
+        }
+
+        const UINT64 loopCapacityFrames =
+            g_enumerator->loopBytes / g_enumerator->loopFormat.Format.nBlockAlign;
+
+        UINT64 loopPadFrames = g_enumerator->loopPaddingFrames;
+        if (loopPadFrames > loopCapacityFrames)
+            loopPadFrames = loopCapacityFrames;
+
+        const double ratio =
+            (double)rate / (double)g_enumerator->loopFormat.Format.nSamplesPerSec;
+
+        UINT64 paddingFrames = static_cast<UINT64>(loopPadFrames * ratio + 0.5);
+        if (paddingFrames > bufferFrames)
+            paddingFrames = bufferFrames;
+
+        *pNumPaddingFrames = static_cast<UINT32>(paddingFrames);
+
         LeaveCriticalSection(&g_enumerator->loopCS);
         return S_OK;
     }
 
     EnterCriticalSection(&cs);
-    UINT32 padding;
+    UINT32 padding = 0;
     HRESULT hr = UpdatePositions(&padding);
     LeaveCriticalSection(&cs);
+
     if (FAILED(hr)) return hr;
     *pNumPaddingFrames = padding;
     return S_OK;
@@ -1483,25 +1531,42 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
 
         EnterCriticalSection(&g_enumerator->loopCS);
 
-        if (g_enumerator->loopBuf == nullptr || g_enumerator->loopBytes == 0)
+        if (g_enumerator->loopBuf == nullptr ||
+            g_enumerator->loopBytes == 0 ||
+            g_enumerator->loopFormat.Format.nSamplesPerSec == 0 ||
+            g_enumerator->loopFormat.Format.nBlockAlign == 0)
         {
             LeaveCriticalSection(&g_enumerator->loopCS);
             *padding = 0;
+            devicePositionFrames = 0;
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
 
-        double ratio = (double)rate / (double)g_enumerator->loopFormat.Format.nSamplesPerSec;
-        UINT32 loopPad = g_enumerator->loopPaddingFrames;
-        UINT64 loopPos = g_enumerator->loopPositionFrames;
+        const UINT64 loopCapacityFrames =
+            g_enumerator->loopBytes / g_enumerator->loopFormat.Format.nBlockAlign;
 
-        *padding = static_cast<UINT32>(loopPad * ratio + 0.5);
-        devicePositionFrames = static_cast<UINT64>(loopPos * ratio + 0.5);
+        UINT64 loopPad = g_enumerator->loopPaddingFrames;
+        if (loopPad > loopCapacityFrames)
+            loopPad = loopCapacityFrames;
+
+        const double ratio =
+            (double)rate / (double)g_enumerator->loopFormat.Format.nSamplesPerSec;
+
+        UINT64 convertedPadding = static_cast<UINT64>(loopPad * ratio + 0.5);
+        if (convertedPadding > bufferFrames)
+            convertedPadding = bufferFrames;
+
+        *padding = static_cast<UINT32>(convertedPadding);
+
+        devicePositionFrames =
+            static_cast<UINT64>(g_enumerator->loopPositionFrames * ratio + 0.5);
 
         LeaveCriticalSection(&g_enumerator->loopCS);
         return S_OK;
     }
 
-    if ((flow == eRender && dsBuffer == nullptr) || (flow == eCapture && dscBuffer == nullptr))
+    if ((flow == eRender && dsBuffer == nullptr) ||
+        (flow == eCapture && dscBuffer == nullptr))
     {
         *padding = 0;
         return S_OK;
@@ -1525,15 +1590,20 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
         positionsInitialized = true;
     }
 
-    //Cursor position fixup
-    DWORD deltaBytes = (curPos >= prevPos) ? (curPos - prevPos) : (bufferBytes - prevPos + curPos);
+    DWORD deltaBytes =
+        (curPos >= prevPos)
+        ? (curPos - prevPos)
+        : (bufferBytes - prevPos + curPos);
+
     UINT32 deltaFrames = deltaBytes / blockAlign;
     devicePositionFrames += deltaFrames;
+
     prevPos = curPos;
 
     if (flow == eRender)
     {
-        UINT32 writePosBytes = static_cast<UINT32>(lastPos % bufferBytes);
+        UINT32 writePosBytes =
+            static_cast<UINT32>(lastPos % bufferBytes);
 
         UINT32 queuedBytes =
             (writePosBytes >= curPos)
@@ -1549,21 +1619,39 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
 
         if (totalWrittenFrames > playedFrames)
         {
-            UINT64 remaining = totalWrittenFrames - playedFrames;
+            UINT64 remaining =
+                totalWrittenFrames - playedFrames;
 
             if (remaining < currentPaddingFrames)
-                currentPaddingFrames = static_cast<UINT32>(remaining);
+                currentPaddingFrames =
+                static_cast<UINT32>(remaining);
         }
         else
         {
             currentPaddingFrames = 0;
         }
     }
+    else
+    {
+        //DirectSound capture
+        UINT32 readPosBytes =
+            static_cast<UINT32>(lastPos % bufferBytes);
+
+        UINT32 availableBytes =
+            (curPos >= readPosBytes)
+            ? (curPos - readPosBytes)
+            : (bufferBytes - readPosBytes + curPos);
+
+        currentPaddingFrames =
+            availableBytes / blockAlign;
+
+        if (currentPaddingFrames > bufferFrames)
+            currentPaddingFrames = bufferFrames;
+    }
 
     *padding = currentPaddingFrames;
     return S_OK;
 }
-
 
 HRESULT __stdcall MyAudioClient::IsFormatSupported(AUDCLNT_SHAREMODE ShareMode, const WAVEFORMATEX* pFormat, WAVEFORMATEX** ppClosestMatch) {
     if (pFormat == NULL) return E_POINTER;
@@ -1614,12 +1702,19 @@ HRESULT __stdcall MyAudioClient::Start()
         HRESULT hr = dsBuffer->Play(0, 0, DSBPLAY_LOOPING);
         if (FAILED(hr)) return hr;
 
+        //force to update position (kickstart logic)
+        {
+            EnterCriticalSection(&cs);
+            UINT32 dummy = 0;
+            UpdatePositions(&dummy);
+            positionsInitialized = true;
+            LeaveCriticalSection(&cs);
+        }
+
         if (dsNotify && isEventDriven)
         {
             if (!notifyEvent)
-            {
                 notifyEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-            }
 
             if (notifyEvent)
             {
@@ -1630,7 +1725,7 @@ HRESULT __stdcall MyAudioClient::Start()
                 if (stepBytes == 0) stepBytes = blockAlign;
 
                 UINT32 numPositions = bufferBytes / stepBytes;
-                if (numPositions < 4) numPositions = 4;
+                if (numPositions < 6) numPositions = 6;
                 if (numPositions > 64) numPositions = 64;
 
                 std::vector<DSBPOSITIONNOTIFY> pos(numPositions);
@@ -1639,6 +1734,10 @@ HRESULT __stdcall MyAudioClient::Start()
                     pos[i].dwOffset = (i * stepBytes) % bufferBytes;
                     pos[i].hEventNotify = notifyEvent;
                 }
+
+
+                if (numPositions >= 2)
+                    pos[0].dwOffset = std::min<DWORD>(1024, stepBytes / 2);
 
                 HRESULT hrNotify = dsNotify->SetNotificationPositions(numPositions, &pos[0]);
                 if (FAILED(hrNotify))
@@ -1651,9 +1750,22 @@ HRESULT __stdcall MyAudioClient::Start()
     }
     else if (flow == eCapture && !isLoopback)
     {
-        if (!dscBuffer) return AUDCLNT_E_NOT_INITIALIZED;
+        if (!dscBuffer)
+            return AUDCLNT_E_NOT_INITIALIZED;
+
+        dscBuffer->Stop();
+
+        positionsInitialized = false;
+        prevPos = 0;
+        lastPos = 0;
+        currentPaddingFrames = 0;
+        devicePositionFrames = 0;
+
         HRESULT hr = dscBuffer->Start(DSCBSTART_LOOPING);
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr))
+            return hr;
+
+        Sleep(10);
     }
     else if (isLoopback)
     {
@@ -1664,9 +1776,7 @@ HRESULT __stdcall MyAudioClient::Start()
         {
             hThread = CreateThread(NULL, 0, MonitorThread, this, 0, NULL);
             if (hThread)
-            {
                 SetThreadPriority(hThread, THREAD_PRIORITY_ABOVE_NORMAL);
-            }
         }
 
         goto finish_start;
@@ -1679,9 +1789,7 @@ HRESULT __stdcall MyAudioClient::Start()
     {
         hThread = CreateThread(NULL, 0, MonitorThread, this, 0, NULL);
         if (hThread)
-        {
             SetThreadPriority(hThread, THREAD_PRIORITY_ABOVE_NORMAL);
-        }
     }
 
 finish_start:
@@ -1692,7 +1800,6 @@ finish_start:
 
     return S_OK;
 }
-
 
 HRESULT __stdcall MyAudioClient::Stop()
 {
@@ -1856,18 +1963,13 @@ DWORD WINAPI MyAudioClient::MonitorThread(LPVOID lpParam)
         if (self->isLoopback)
         {
             if (g_enumerator->loopEvent)
-            {
                 WaitForSingleObject(g_enumerator->loopEvent, INFINITE);
-            }
             else
-            {
                 Sleep(1);
-                continue;
-            }
         }
         else if (self->notifyEvent)
         {
-            WaitForSingleObject(self->notifyEvent, INFINITE);
+            WaitForSingleObject(self->notifyEvent, 10);
         }
         else
         {
@@ -1884,21 +1986,12 @@ DWORD WINAPI MyAudioClient::MonitorThread(LPVOID lpParam)
 
         if (self->hEvent)
         {
-            bool shouldSignal;
-
-            if (self->flow == eRender && !self->isLoopback)
-            {
-                shouldSignal = (pad < (self->bufferFrames / 2));
-            }
-            else
-            {
-                shouldSignal = (pad > 0);
-            }
+            bool shouldSignal = (self->flow == eRender && !self->isLoopback)
+                ? (pad < (self->bufferFrames / 2))
+                : (pad > 0);
 
             if (shouldSignal)
-            {
                 SetEvent(self->hEvent);
-            }
         }
     }
 
@@ -2005,8 +2098,20 @@ HRESULT MyAudioClient::GetPosition(UINT64* pu64Position, UINT64* pu64QPCPosition
         }
 
         EnterCriticalSection(&g_enumerator->loopCS);
-        double ratio = (double)rate / (double)g_enumerator->loopFormat.Format.nSamplesPerSec;
+
+        if (g_enumerator->loopFormat.Format.nSamplesPerSec == 0)
+        {
+            *pu64Position = 0;
+            LeaveCriticalSection(&g_enumerator->loopCS);
+            if (pu64QPCPosition) *pu64QPCPosition = 0;
+            return S_OK;
+        }
+
+        const double ratio =
+            (double)rate / (double)g_enumerator->loopFormat.Format.nSamplesPerSec;
+
         *pu64Position = static_cast<UINT64>(g_enumerator->loopPositionFrames * ratio + 0.5);
+
         LeaveCriticalSection(&g_enumerator->loopCS);
     }
     else
@@ -2023,17 +2128,15 @@ HRESULT MyAudioClient::GetPosition(UINT64* pu64Position, UINT64* pu64QPCPosition
 
         if (flow == eRender)
         {
-            if (totalWrittenFrames > currentPaddingFrames)
-                *pu64Position = totalWrittenFrames - currentPaddingFrames;
-            else
-                *pu64Position = 0;
+            *pu64Position = (totalWrittenFrames > currentPaddingFrames)
+                ? (totalWrittenFrames - currentPaddingFrames)
+                : 0;
         }
         else
         {
-            if (devicePositionFrames > currentPaddingFrames)
-                *pu64Position = devicePositionFrames - currentPaddingFrames;
-            else
-                *pu64Position = 0;
+            *pu64Position = (devicePositionFrames > currentPaddingFrames)
+                ? (devicePositionFrames - currentPaddingFrames)
+                : 0;
         }
 
         LeaveCriticalSection(&cs);
@@ -2246,11 +2349,24 @@ HRESULT __stdcall MyRenderClient::GetBuffer(UINT32 NumFramesRequested, BYTE** pp
         return hr;
     }
 
+    //overflow protection
+    if (!parent->positionsInitialized || parent->totalWrittenFrames == 0)
+    {
+        padding = 0;
+    }
+
     UINT32 availableFrames = (parent->bufferFrames > padding) ? (parent->bufferFrames - padding) : 0;
     if (NumFramesRequested > availableFrames)
     {
-        LeaveCriticalSection(&parent->cs);
-        return AUDCLNT_E_BUFFER_TOO_LARGE;
+        if (parent->totalWrittenFrames == 0 && NumFramesRequested <= parent->bufferFrames)
+        {
+            availableFrames = parent->bufferFrames;
+        }
+        else
+        {
+            LeaveCriticalSection(&parent->cs);
+            return AUDCLNT_E_BUFFER_TOO_LARGE;
+        }
     }
 
     UINT32 bytes = NumFramesRequested * parent->blockAlign;
@@ -2408,14 +2524,34 @@ HRESULT __stdcall MyCaptureClient::GetBuffer(BYTE** ppData, UINT32* pNumFramesTo
 
     if (parent->isLoopback)
     {
-        if (g_enumerator == nullptr) {
+        if (g_enumerator == nullptr)
+        {
             *ppData = NULL;
             *pNumFramesToRead = 0;
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
+
         EnterCriticalSection(&g_enumerator->loopCS);
-        UINT32 loopPadFrames = g_enumerator->loopPaddingFrames;
-        if (loopPadFrames == 0)
+
+        if (g_enumerator->loopBuf == nullptr ||
+            g_enumerator->loopBytes == 0 ||
+            g_enumerator->loopFormat.Format.nSamplesPerSec == 0 ||
+            g_enumerator->loopFormat.Format.nBlockAlign == 0)
+        {
+            *ppData = NULL;
+            *pNumFramesToRead = 0;
+            LeaveCriticalSection(&g_enumerator->loopCS);
+            return AUDCLNT_E_DEVICE_INVALIDATED;
+        }
+
+        const UINT64 loopCapacityFrames =
+            g_enumerator->loopBytes / g_enumerator->loopFormat.Format.nBlockAlign;
+
+        UINT64 loopPadFrames64 = g_enumerator->loopPaddingFrames;
+        if (loopPadFrames64 > loopCapacityFrames)
+            loopPadFrames64 = loopCapacityFrames;
+
+        if (loopPadFrames64 == 0)
         {
             *ppData = NULL;
             *pNumFramesToRead = 0;
@@ -2424,11 +2560,14 @@ HRESULT __stdcall MyCaptureClient::GetBuffer(BYTE** ppData, UINT32* pNumFramesTo
         }
 
         double ratio = (double)parent->rate / g_enumerator->loopFormat.Format.nSamplesPerSec;
-        UINT32 frames = static_cast<UINT32>(loopPadFrames * ratio + 0.5);
+        UINT32 frames = static_cast<UINT32>(loopPadFrames64 * ratio + 0.5);
+        if (frames > parent->bufferFrames)
+            frames = parent->bufferFrames;
+
         UINT32 parentChannels = parent->format.Format.nChannels;
         UINT32 loopChannels = g_enumerator->loopFormat.Format.nChannels;
         UINT32 loopBlockAlign = g_enumerator->loopFormat.Format.nBlockAlign;
-        UINT32 loopBytesToRead = loopPadFrames * loopBlockAlign;
+        UINT32 loopBytesToRead = static_cast<UINT32>(loopPadFrames64) * loopBlockAlign;
 
         bool formatsMatch = (parent->rate == g_enumerator->loopFormat.Format.nSamplesPerSec &&
             parentChannels == loopChannels &&
@@ -2438,18 +2577,22 @@ HRESULT __stdcall MyCaptureClient::GetBuffer(BYTE** ppData, UINT32* pNumFramesTo
 
         if (formatsMatch)
         {
-            //direct memcpy
             UINT32 pos = static_cast<UINT32>(g_enumerator->loopReadPos % g_enumerator->loopBytes);
             UINT32 bytes1 = std::min(loopBytesToRead, g_enumerator->loopBytes - pos);
             memcpy(tempBuffer, g_enumerator->loopBuf + pos, bytes1);
             if (bytes1 < loopBytesToRead)
                 memcpy(tempBuffer + bytes1, g_enumerator->loopBuf, loopBytesToRead - bytes1);
 
-            parent->ApplyVolumes(tempBuffer, loopPadFrames);
+            parent->ApplyVolumes(tempBuffer, static_cast<UINT32>(loopPadFrames64));
             *ppData = tempBuffer;
-            *pNumFramesToRead = loopPadFrames;
+            *pNumFramesToRead = static_cast<UINT32>(loopPadFrames64);
+
             if (pu64DevicePosition)
-                *pu64DevicePosition = static_cast<UINT64>(g_enumerator->loopPositionFrames * ratio + 0.5) - loopPadFrames;
+            {
+                UINT64 posFrames = static_cast<UINT64>(g_enumerator->loopPositionFrames * ratio + 0.5);
+                *pu64DevicePosition = (posFrames > loopPadFrames64) ? (posFrames - loopPadFrames64) : 0;
+            }
+
             if (pu64QPCPosition)
                 QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(pu64QPCPosition));
 
@@ -2458,7 +2601,6 @@ HRESULT __stdcall MyCaptureClient::GetBuffer(BYTE** ppData, UINT32* pNumFramesTo
             return S_OK;
         }
 
-        //reuse vectors
         if (m_loopRawBuf.size() < loopBytesToRead)
             m_loopRawBuf.resize(loopBytesToRead);
         BYTE* rawData = m_loopRawBuf.data();
@@ -2469,19 +2611,19 @@ HRESULT __stdcall MyCaptureClient::GetBuffer(BYTE** ppData, UINT32* pNumFramesTo
         if (bytes1 < loopBytesToRead)
             memcpy(rawData + bytes1, g_enumerator->loopBuf, loopBytesToRead - bytes1);
 
-        UINT32 loopSamples = loopPadFrames * loopChannels;
+        UINT32 loopSamples = static_cast<UINT32>(loopPadFrames64) * loopChannels;
         if (m_loopFRaw.size() < loopSamples)
             m_loopFRaw.resize(loopSamples);
         float* fRaw = m_loopFRaw.data();
 
-        ConvertToFloat(rawData, g_enumerator->loopFormat, fRaw, loopPadFrames);
+        ConvertToFloat(rawData, g_enumerator->loopFormat, fRaw, static_cast<UINT32>(loopPadFrames64));
 
         UINT32 destSamples = frames * parentChannels;
         if (m_loopFDest.size() < destSamples)
             m_loopFDest.resize(destSamples);
         float* fDest = m_loopFDest.data();
 
-        ResampleFloat(fRaw, loopChannels, loopPadFrames, fDest, parentChannels, frames, ratio);
+        ResampleFloat(fRaw, loopChannels, static_cast<UINT32>(loopPadFrames64), fDest, parentChannels, frames, ratio);
 
         ConvertFromFloat(fDest, parent->format, tempBuffer, frames);
         parent->ApplyVolumes(tempBuffer, frames);
@@ -2490,7 +2632,11 @@ HRESULT __stdcall MyCaptureClient::GetBuffer(BYTE** ppData, UINT32* pNumFramesTo
         *pNumFramesToRead = frames;
 
         if (pu64DevicePosition)
-            *pu64DevicePosition = static_cast<UINT64>(g_enumerator->loopPositionFrames * ratio + 0.5) - frames;
+        {
+            UINT64 posFrames = static_cast<UINT64>(g_enumerator->loopPositionFrames * ratio + 0.5);
+            *pu64DevicePosition = (posFrames > frames) ? (posFrames - frames) : 0;
+        }
+
         if (pu64QPCPosition)
             QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(pu64QPCPosition));
 
@@ -2499,59 +2645,94 @@ HRESULT __stdcall MyCaptureClient::GetBuffer(BYTE** ppData, UINT32* pNumFramesTo
         return S_OK;
     }
 
-    //capture (not loopback)
     UINT32 padding;
     parent->GetCurrentPadding(&padding);
-    if (padding == 0) {
+    if (padding == 0)
+    {
         *ppData = NULL;
         *pNumFramesToRead = 0;
         return S_OK;
     }
+
     UINT32 bytes = padding * parent->blockAlign;
     EnterCriticalSection(&parent->cs);
     HRESULT hr = parent->dscBuffer->Lock(static_cast<DWORD>(parent->lastPos % parent->bufferBytes), bytes, &parent->lockP1, &parent->lockL1, &parent->lockP2, &parent->lockL2, 0);
-    if (FAILED(hr)) {
+    if (FAILED(hr))
+    {
         LeaveCriticalSection(&parent->cs);
         return AUDCLNT_E_DEVICE_INVALIDATED;
     }
+
     usingTemp = (parent->lockP2 != NULL);
-    if (usingTemp) {
+    if (usingTemp)
+    {
         memcpy(tempBuffer, parent->lockP1, parent->lockL1);
         if (parent->lockP2) memcpy(tempBuffer + parent->lockL1, parent->lockP2, parent->lockL2);
         *ppData = tempBuffer;
     }
-    else {
+    else
+    {
         *ppData = static_cast<BYTE*>(parent->lockP1);
     }
+
     BYTE* dataToApply = usingTemp ? tempBuffer : static_cast<BYTE*>(parent->lockP1);
     parent->ApplyVolumes(dataToApply, padding);
     *pNumFramesToRead = padding;
-    if (pu64DevicePosition) *pu64DevicePosition = parent->devicePositionFrames - padding;
+
+    if (pu64DevicePosition)
+        *pu64DevicePosition = (parent->devicePositionFrames > padding) ? (parent->devicePositionFrames - padding) : 0;
+
     if (pu64QPCPosition) QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(pu64QPCPosition));
     parent->locked = true;
     LeaveCriticalSection(&parent->cs);
     return S_OK;
 }
 
-HRESULT __stdcall MyCaptureClient::ReleaseBuffer(UINT32 NumFramesRead) {
+HRESULT __stdcall MyCaptureClient::ReleaseBuffer(UINT32 NumFramesRead)
+{
     if (!parent->locked) return AUDCLNT_E_OUT_OF_ORDER;
+
     UINT32 bytes = NumFramesRead * parent->blockAlign;
-    if (parent->isLoopback) {
+
+    if (parent->isLoopback)
+    {
         EnterCriticalSection(&g_enumerator->loopCS);
+
+        if (g_enumerator->loopFormat.Format.nSamplesPerSec == 0 ||
+            g_enumerator->loopFormat.Format.nBlockAlign == 0)
+        {
+            parent->locked = false;
+            LeaveCriticalSection(&g_enumerator->loopCS);
+            return AUDCLNT_E_DEVICE_INVALIDATED;
+        }
+
+        const UINT64 loopCapacityFrames =
+            g_enumerator->loopBytes / g_enumerator->loopFormat.Format.nBlockAlign;
+
+        UINT64 availableFrames = g_enumerator->loopPaddingFrames;
+        if (availableFrames > loopCapacityFrames)
+            availableFrames = loopCapacityFrames;
+
         double ratio = (double)g_enumerator->loopFormat.Format.nSamplesPerSec / parent->rate;
-        UINT32 loopFramesReleased = static_cast<UINT32>(NumFramesRead * ratio + 0.5f);
+        UINT64 loopFramesReleased = static_cast<UINT64>(NumFramesRead * ratio + 0.5f);
+
+        if (loopFramesReleased > availableFrames)
+            loopFramesReleased = availableFrames;
+
         g_enumerator->loopReadPos += loopFramesReleased * g_enumerator->loopFormat.Format.nBlockAlign;
-        g_enumerator->loopPaddingFrames = (loopFramesReleased > g_enumerator->loopPaddingFrames) ? 0 : g_enumerator->loopPaddingFrames - loopFramesReleased;
+        g_enumerator->loopPaddingFrames = static_cast<UINT32>(availableFrames - loopFramesReleased);
+
         LeaveCriticalSection(&g_enumerator->loopCS);
         parent->locked = false;
         return S_OK;
     }
+
     EnterCriticalSection(&parent->cs);
     DWORD bytes1 = std::min<DWORD>(bytes, parent->lockL1);
     DWORD bytes2 = (bytes > parent->lockL1 && parent->lockP2) ? (bytes - parent->lockL1) : 0;
     parent->dscBuffer->Unlock(parent->lockP1, bytes1, parent->lockP2, bytes2);
     parent->lastPos += bytes;
-    parent->currentPaddingFrames = (NumFramesRead > parent->currentPaddingFrames) ? 0 : parent->currentPaddingFrames - NumFramesRead;
+    parent->currentPaddingFrames = (NumFramesRead >= parent->currentPaddingFrames) ? 0 : parent->currentPaddingFrames - NumFramesRead;
     parent->locked = false;
     LeaveCriticalSection(&parent->cs);
     return S_OK;
@@ -3999,7 +4180,7 @@ extern "C" {
     {
         if (ppv == NULL) return E_POINTER;
         if (g_blacklisted)
-            return CLASS_E_CLASSNOTAVAILABLE;
+            return REGDB_E_CLASSNOTREG;
 
         if (!IsEqualCLSID(rclsid, CLSID_MMDeviceEnumerator))
             return CLASS_E_CLASSNOTAVAILABLE;
