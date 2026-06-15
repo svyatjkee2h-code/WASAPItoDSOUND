@@ -150,15 +150,32 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
     if (srcChannels == destChannels) {
         const UINT32 channels = srcChannels;
 
-        if (g_hasSSE2) {
-            //SSE2 optimization
+        //SSE2 for stereo
+        if (channels == 2 && g_hasSSE2) {
             for (UINT32 i = 0; i < destFrames; ++i) {
                 UINT32 ipos = static_cast<UINT32>(pos);
                 float frac = (ipos >= srcFrames - 1) ? 0.0f : static_cast<float>(pos - ipos);
-
+                const float* s0 = src + ipos * 2;
+                const float* s1 = (ipos + 1 < srcFrames) ? (s0 + 2) : s0;
+                __m128 v0 = _mm_castsi128_ps(_mm_loadl_epi64((const __m128i*)s0));
+                __m128 v1 = _mm_castsi128_ps(_mm_loadl_epi64((const __m128i*)s1));
                 __m128 f = _mm_set1_ps(frac);
                 __m128 omf = _mm_sub_ps(_mm_set1_ps(1.0f), f);
+                __m128 res = _mm_add_ps(_mm_mul_ps(v0, omf), _mm_mul_ps(v1, f));
+                _mm_store_sd((double*)(dest + i * 2), _mm_castps_pd(res));
 
+                pos += step;
+            }
+            return;
+        }
+
+        //SSE2 for channels >= 4
+        if (g_hasSSE2) {
+            for (UINT32 i = 0; i < destFrames; ++i) {
+                UINT32 ipos = static_cast<UINT32>(pos);
+                float frac = (ipos >= srcFrames - 1) ? 0.0f : static_cast<float>(pos - ipos);
+                __m128 f = _mm_set1_ps(frac);
+                __m128 omf = _mm_sub_ps(_mm_set1_ps(1.0f), f);
                 const float* s0 = src + ipos * channels;
                 const float* s1 = (ipos + 1 < srcFrames) ? (s0 + channels) : s0;
 
@@ -170,7 +187,7 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
                     _mm_storeu_ps(dest + i * channels + c, res);
                 }
 
-                //excessive channels
+                //Remaining channels
                 for (; c < channels; ++c) {
                     const float v0 = s0[c];
                     const float v1 = (ipos + 1 < srcFrames) ? s1[c] : v0;
@@ -182,7 +199,7 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
             return;
         }
 
-        //scalar fallback
+        // Scalar fallback for all channels
         for (UINT32 i = 0; i < destFrames; ++i) {
             UINT32 ipos = static_cast<UINT32>(pos);
             float frac = (ipos >= srcFrames - 1) ? 0.0f : static_cast<float>(pos - ipos);
@@ -248,7 +265,7 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
             return;
         }
 
-        //scalar fallback
+        // Scalar fallback
         for (UINT32 i = 0; i < destFrames; ++i) {
             UINT32 ipos = static_cast<UINT32>(pos);
             float frac = (ipos >= srcFrames - 1) ? 0.0f : static_cast<float>(pos - ipos);
@@ -310,7 +327,7 @@ static void ConvertFromFloat16(const float* fSrc, int16_t* dest, UINT32 samples)
             _mm_storel_epi64(reinterpret_cast<__m128i*>(dest + i), packed);
         }
 
-        // fallback
+        //fallback
         for (; i < samples; ++i)
         {
             float v = fSrc[i] * 32768.0f;
@@ -1524,45 +1541,24 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
 
     if (isLoopback)
     {
-        if (g_enumerator == nullptr)
-        {
-            *padding = 0;
-            devicePositionFrames = 0;
+        if (g_enumerator == nullptr) {
+            *padding = 0; devicePositionFrames = 0;
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
-
         EnterCriticalSection(&g_enumerator->loopCS);
-
-        if (g_enumerator->loopBuf == nullptr ||
-            g_enumerator->loopBytes == 0 ||
-            g_enumerator->loopFormat.Format.nSamplesPerSec == 0 ||
-            g_enumerator->loopFormat.Format.nBlockAlign == 0)
-        {
+        if (g_enumerator->loopBuf == nullptr || g_enumerator->loopBytes == 0 || g_enumerator->loopFormat.Format.nSamplesPerSec == 0 || g_enumerator->loopFormat.Format.nBlockAlign == 0) {
             LeaveCriticalSection(&g_enumerator->loopCS);
-            *padding = 0;
-            devicePositionFrames = 0;
+            *padding = 0; devicePositionFrames = 0;
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
-
-        const UINT64 loopCapacityFrames =
-            g_enumerator->loopBytes / g_enumerator->loopFormat.Format.nBlockAlign;
-
+        const UINT64 loopCapacityFrames = g_enumerator->loopBytes / g_enumerator->loopFormat.Format.nBlockAlign;
         UINT64 loopPad = g_enumerator->loopPaddingFrames;
-        if (loopPad > loopCapacityFrames)
-            loopPad = loopCapacityFrames;
-
-        const double ratio =
-            (double)rate / (double)g_enumerator->loopFormat.Format.nSamplesPerSec;
-
+        if (loopPad > loopCapacityFrames) loopPad = loopCapacityFrames;
+        const double ratio = (double)rate / (double)g_enumerator->loopFormat.Format.nSamplesPerSec;
         UINT64 convertedPadding = static_cast<UINT64>(loopPad * ratio + 0.5);
-        if (convertedPadding > bufferFrames)
-            convertedPadding = bufferFrames;
-
+        if (convertedPadding > bufferFrames) convertedPadding = bufferFrames;
         *padding = static_cast<UINT32>(convertedPadding);
-
-        devicePositionFrames =
-            static_cast<UINT64>(g_enumerator->loopPositionFrames * ratio + 0.5);
-
+        devicePositionFrames = static_cast<UINT64>(g_enumerator->loopPositionFrames * ratio + 0.5);
         LeaveCriticalSection(&g_enumerator->loopCS);
         return S_OK;
     }
@@ -1574,14 +1570,19 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
         return S_OK;
     }
 
+    DWORD pos1 = 0;
+    DWORD pos2 = 0;
     DWORD curPos = 0;
-    DWORD curSafe = 0;
     HRESULT hr = S_OK;
 
-    if (flow == eRender)
-        hr = dsBuffer->GetCurrentPosition(&curPos, &curSafe);
-    else
-        hr = dscBuffer->GetCurrentPosition(&curPos, &curSafe);
+    if (flow == eRender) {
+        hr = dsBuffer->GetCurrentPosition(&pos1, &pos2);
+        curPos = pos1;
+    }
+    else {
+        hr = dscBuffer->GetCurrentPosition(&pos1, &pos2);
+        curPos = pos2;
+    }
 
     if (FAILED(hr))
         return hr;
@@ -1604,14 +1605,8 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
 
     if (flow == eRender)
     {
-        UINT32 writePosBytes =
-            static_cast<UINT32>(lastPos % bufferBytes);
-
-        UINT32 queuedBytes =
-            (writePosBytes >= curPos)
-            ? (writePosBytes - curPos)
-            : (bufferBytes - curPos + writePosBytes);
-
+        UINT32 writePosBytes = static_cast<UINT32>(lastPos % bufferBytes);
+        UINT32 queuedBytes = (writePosBytes >= curPos) ? (writePosBytes - curPos) : (bufferBytes - curPos + writePosBytes);
         currentPaddingFrames = queuedBytes / blockAlign;
 
         if (currentPaddingFrames > bufferFrames)
@@ -1621,12 +1616,9 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
 
         if (totalWrittenFrames > playedFrames)
         {
-            UINT64 remaining =
-                totalWrittenFrames - playedFrames;
-
+            UINT64 remaining = totalWrittenFrames - playedFrames;
             if (remaining < currentPaddingFrames)
-                currentPaddingFrames =
-                static_cast<UINT32>(remaining);
+                currentPaddingFrames = static_cast<UINT32>(remaining);
         }
         else
         {
@@ -1636,16 +1628,13 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
     else
     {
         //DirectSound capture
-        UINT32 readPosBytes =
-            static_cast<UINT32>(lastPos % bufferBytes);
-
+        UINT32 readPosBytes = static_cast<UINT32>(lastPos % bufferBytes);
         UINT32 availableBytes =
             (curPos >= readPosBytes)
             ? (curPos - readPosBytes)
             : (bufferBytes - readPosBytes + curPos);
 
-        currentPaddingFrames =
-            availableBytes / blockAlign;
+        currentPaddingFrames = availableBytes / blockAlign;
 
         if (currentPaddingFrames > bufferFrames)
             currentPaddingFrames = bufferFrames;
@@ -1988,9 +1977,18 @@ DWORD WINAPI MyAudioClient::MonitorThread(LPVOID lpParam)
 
         if (self->hEvent)
         {
-            bool shouldSignal = (self->flow == eRender && !self->isLoopback)
-                ? (pad < (self->bufferFrames / 2))
-                : (pad > 0);
+            bool shouldSignal = false;
+            if (self->flow == eRender && !self->isLoopback)
+            {
+                shouldSignal = (pad < (self->bufferFrames / 2));
+            }
+            else
+            {
+                UINT32 threshold = (self->periodFrames > 0) ? self->periodFrames : (self->rate / 100);
+                if (threshold == 0) threshold = 1;
+
+                shouldSignal = (pad >= threshold);
+            }
 
             if (shouldSignal)
                 SetEvent(self->hEvent);
