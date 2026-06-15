@@ -280,9 +280,8 @@ static void ConvertToFloat16(const int16_t* src, float* destFloat, UINT32 sample
         for (; i + 4 <= samples; i += 4)
         {
             __m128i v = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + i));
-            __m128i sign = _mm_srai_epi16(v, 15);
-            __m128i extended = _mm_unpacklo_epi16(v, sign);
-            __m128 f = _mm_cvtepi32_ps(extended);
+            __m128i v32 = _mm_srai_epi32(_mm_unpacklo_epi16(v, v), 16);
+            __m128 f = _mm_cvtepi32_ps(v32);
             f = _mm_mul_ps(f, scale);
             _mm_storeu_ps(destFloat + i, f);
         }
@@ -300,31 +299,34 @@ static void ConvertFromFloat16(const float* fSrc, int16_t* dest, UINT32 samples)
 {
     if (g_hasSSE2)
     {
-        __m128 minv = _mm_set1_ps(-1.0f);
-        __m128 maxv = _mm_set1_ps(1.0f);
-        __m128 scale = _mm_set1_ps(32767.0f);
+        __m128 scale = _mm_set1_ps(32768.0f);
         UINT32 i = 0;
         for (; i + 4 <= samples; i += 4)
         {
             __m128 f = _mm_loadu_ps(fSrc + i);
-            f = _mm_max_ps(_mm_min_ps(f, maxv), minv);
             f = _mm_mul_ps(f, scale);
-            __m128i i32 = _mm_cvttps_epi32(f);
+            __m128i i32 = _mm_cvtps_epi32(f);
             __m128i packed = _mm_packs_epi32(i32, _mm_setzero_si128());
             _mm_storel_epi64(reinterpret_cast<__m128i*>(dest + i), packed);
         }
+
+        // fallback
         for (; i < samples; ++i)
         {
-            float v = std::max(std::min(fSrc[i], 1.0f), -1.0f);
-            dest[i] = static_cast<int16_t>(v * 32767.0f);
+            float v = fSrc[i] * 32768.0f;
+            if (v > 32767.0f) v = 32767.0f;
+            else if (v < -32768.0f) v = -32768.0f;
+            dest[i] = static_cast<int16_t>(std::round(v));
         }
     }
     else
     {
         for (UINT32 i = 0; i < samples; ++i)
         {
-            float v = std::max(std::min(fSrc[i], 1.0f), -1.0f);
-            dest[i] = static_cast<int16_t>(v * 32767.0f);
+            float v = fSrc[i] * 32768.0f;
+            if (v > 32767.0f) v = 32767.0f;
+            else if (v < -32768.0f) v = -32768.0f;
+            dest[i] = static_cast<int16_t>(std::round(v));
         }
     }
 }
