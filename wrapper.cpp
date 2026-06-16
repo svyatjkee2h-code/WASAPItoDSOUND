@@ -1380,7 +1380,7 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
 
     if (!isLoopback) {
         UINT32 minSafeFrames = 2048U;
-        if (lowLatencyShared && periodFrames > 0) {.
+        if (lowLatencyShared && periodFrames > 0) {
             bufferFrames = std::max({ bufferFrames, periodFrames * 4, minSafeFrames });
         }
         else {
