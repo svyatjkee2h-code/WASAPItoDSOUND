@@ -297,7 +297,8 @@ static void ConvertToFloat16(const int16_t* src, float* destFloat, UINT32 sample
         for (; i + 4 <= samples; i += 4)
         {
             __m128i v = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + i));
-            __m128i v32 = _mm_srai_epi32(_mm_unpacklo_epi16(v, v), 16);
+            __m128i sign = _mm_srai_epi16(v, 15);
+            __m128i v32 = _mm_unpacklo_epi16(v, sign);
             __m128 f = _mm_cvtepi32_ps(v32);
             f = _mm_mul_ps(f, scale);
             _mm_storeu_ps(destFloat + i, f);
@@ -850,19 +851,25 @@ void MyDeviceEnumerator::FeedLoopback(const BYTE* pData, UINT32 numFrames, const
     }
     else
     {
+        // use static memory able to be reused
+        static vector<float> s_fSrc;
+        static vector<float> s_fDest;
+        static vector<BYTE> s_tempWrite;
+
         UINT32 srcSamples = numFrames * srcChannels;
-        vector<float> fSrc(srcSamples);
-        ConvertToFloat(pData, srcFmt, fSrc.data(), numFrames);
+        if (s_fSrc.size() < srcSamples) s_fSrc.resize(srcSamples);
+        ConvertToFloat(pData, srcFmt, s_fSrc.data(), numFrames);
 
         UINT32 destSamples = destFrames * loopChannels;
-        vector<float> fDest(destSamples);
-        ResampleFloat(fSrc.data(), srcChannels, numFrames, fDest.data(), loopChannels, destFrames, ratio);
+        if (s_fDest.size() < destSamples) s_fDest.resize(destSamples);
+        ResampleFloat(s_fSrc.data(), srcChannels, numFrames, s_fDest.data(), loopChannels, destFrames, ratio);
 
-        tempWrite.resize(destFrames * loopFormat.Format.nBlockAlign);
-        ConvertFromFloat(fDest.data(), loopFormat, tempWrite.data(), destFrames);
+        UINT32 tempWriteSize = destFrames * loopFormat.Format.nBlockAlign;
+        if (s_tempWrite.size() < tempWriteSize) s_tempWrite.resize(tempWriteSize);
+        ConvertFromFloat(s_fDest.data(), loopFormat, s_tempWrite.data(), destFrames);
 
-        bytesToWrite = static_cast<UINT32>(tempWrite.size());
-        writeData = tempWrite.data();
+        bytesToWrite = tempWriteSize;
+        writeData = s_tempWrite.data();
     }
 
     UINT64 addedFrames = formatsMatch ? static_cast<UINT64>(numFrames) : static_cast<UINT64>(destFrames);
@@ -1318,16 +1325,13 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     if (bufferDuration == 0) return AUDCLNT_E_BUFFER_SIZE_ERROR;
     bufferFrames = static_cast<UINT32>(((bufferDuration * static_cast<REFERENCE_TIME>(rate)) + 5000000LL) / 10000000LL);
     if (bufferFrames == 0) return AUDCLNT_E_BUFFER_SIZE_ERROR;
-    if (flow == eRender && !isLoopback) {
+    if (!isLoopback) {
+        UINT32 minSafeFrames = 2048U;
         if (lowLatencyShared && periodFrames > 0) {
-            //Creating buffer equal to a period
-            if (bufferFrames < periodFrames * 2) bufferFrames = periodFrames * 2;
-            else if (bufferFrames > periodFrames * 4) bufferFrames = periodFrames * 4;
+            bufferFrames = std::max({ bufferFrames * 4, periodFrames * 4, minSafeFrames });
         }
         else {
-            //standart logic to other modes
-            UINT32 minFrames = 2048U;
-            bufferFrames = std::max({ bufferFrames * 4, minFrames, 4096U });
+            bufferFrames = std::max({ bufferFrames * 4, minSafeFrames, 4096U });
         }
     }
 
@@ -1741,22 +1745,30 @@ HRESULT __stdcall MyAudioClient::Start()
     }
     else if (flow == eCapture && !isLoopback)
     {
-        if (!dscBuffer)
-            return AUDCLNT_E_NOT_INITIALIZED;
+        if (!dscBuffer) return AUDCLNT_E_NOT_INITIALIZED;
 
         dscBuffer->Stop();
+        HRESULT hr = dscBuffer->Start(DSCBSTART_LOOPING);
+        if (FAILED(hr)) return hr;
+        Sleep(10);
 
-        positionsInitialized = false;
-        prevPos = 0;
-        lastPos = 0;
+        DWORD pos1 = 0, pos2 = 0;
+        hr = dscBuffer->GetCurrentPosition(&pos1, &pos2);
+        if (SUCCEEDED(hr))
+        {
+            lastPos = pos2;
+            prevPos = pos2;
+            positionsInitialized = true;
+        }
+        else
+        {
+            positionsInitialized = false;
+            lastPos = 0;
+            prevPos = 0;
+        }
+
         currentPaddingFrames = 0;
         devicePositionFrames = 0;
-
-        HRESULT hr = dscBuffer->Start(DSCBSTART_LOOPING);
-        if (FAILED(hr))
-            return hr;
-
-        Sleep(10);
     }
     else if (isLoopback)
     {
@@ -2561,8 +2573,12 @@ HRESULT __stdcall MyCaptureClient::GetBuffer(BYTE** ppData, UINT32* pNumFramesTo
 
         double ratio = (double)parent->rate / g_enumerator->loopFormat.Format.nSamplesPerSec;
         UINT32 frames = static_cast<UINT32>(loopPadFrames64 * ratio + 0.5);
+
         if (frames > parent->bufferFrames)
+        {
             frames = parent->bufferFrames;
+            loopPadFrames64 = static_cast<UINT64>(frames / ratio + 0.5);
+        }
 
         UINT32 parentChannels = parent->format.Format.nChannels;
         UINT32 loopChannels = g_enumerator->loopFormat.Format.nChannels;
