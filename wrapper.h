@@ -1,3 +1,4 @@
+//wrapper.h
 #define WRAPPER_H
 
 #define NOMINMAX
@@ -133,6 +134,10 @@ private:
     vector<DeviceInfo> m_renderDevices;
     vector<DeviceInfo> m_captureDevices;
 
+    std::vector<float> m_loopFRaw;
+    std::vector<float> m_loopFDest;
+    std::vector<BYTE>  m_tempWrite;
+
     void PopulateDeviceCaches();
 
     friend class MyAudioClient;
@@ -209,6 +214,12 @@ public:
 
 class MyAudioClient : public IAudioClient3 {
 private:
+    friend class MyRenderClient;
+    friend class MyCaptureClient;
+    friend class MyAudioClock;
+    friend class MyAudioClock2;
+    friend class MyAudioStreamVolume;
+    friend class MyAudioMeterInformation;
     IUnknown* m_pUnkOuter;
     IUnknown* m_pUnkMarshal;
     LONG ref;
@@ -239,12 +250,6 @@ private:
     CRITICAL_SECTION cs;
     static DWORD WINAPI MonitorThread(LPVOID lpParam);
     HRESULT UpdatePositions(UINT32* padding);
-    friend class MyRenderClient;
-    friend class MyCaptureClient;
-    friend class MyAudioClock;
-    friend class MyAudioClock2;
-    friend class MyAudioStreamVolume;
-    friend class MyAudioMeterInformation;
     UINT32 currentPaddingFrames;
     DWORD prevPos;
     bool positionsInitialized;
@@ -293,6 +298,8 @@ public:
     virtual HRESULT __stdcall InitializeSharedAudioStream(DWORD StreamFlags, UINT32 PeriodInFrames, const WAVEFORMATEX* pFormat, const GUID* AudioSessionGuid);
     void UpdateVolume();
     HRESULT GetPosition(UINT64* pu64Position, UINT64* pu64QPCPosition);
+    UINT32 minFramesThreshold = 480;
+    DWORD lastSignalTime = 0;
 };
 
 class MyRenderClient : public IAudioRenderClient {
