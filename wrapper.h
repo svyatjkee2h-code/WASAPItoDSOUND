@@ -43,6 +43,7 @@ class MyAudioSession;
 class MyAudioStreamVolume;
 
 extern MyDeviceEnumerator* g_enumerator;
+MyDeviceEnumerator* GetGlobalEnumerator();
 
 #ifndef AUDCLNT_STREAMFLAGS_CROSSPROCESS
 #define AUDCLNT_STREAMFLAGS_CROSSPROCESS 0x00010000
