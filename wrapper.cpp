@@ -150,19 +150,41 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
     if (srcChannels == destChannels) {
         const UINT32 channels = srcChannels;
 
-        //SSE2 for stereo
+	//SSE2 for stereo
         if (channels == 2 && g_hasSSE2) {
-            for (UINT32 i = 0; i < destFrames; ++i) {
+            const __m128 one = _mm_set1_ps(1.0f);
+            UINT32 i = 0;
+            UINT32 mainDestFrames = 0;
+            if (srcFrames > 1) {
+                double maxMainFrames = static_cast<double>(srcFrames - 1) * ratio;
+                mainDestFrames = (maxMainFrames < destFrames) ? static_cast<UINT32>(maxMainFrames) : destFrames;
+            }
+            for (; i < mainDestFrames; ++i) {
+                UINT32 ipos = static_cast<UINT32>(pos);
+                float frac = static_cast<float>(pos - ipos);
+                const float* s0 = src + ipos * 2;
+
+                __m128 v0 = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(s0)));
+                __m128 v1 = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(s0 + 2)));
+                __m128 f = _mm_set1_ps(frac);
+                __m128 omf = _mm_sub_ps(one, f);
+                __m128 res = _mm_add_ps(_mm_mul_ps(v0, omf), _mm_mul_ps(v1, f));
+                _mm_store_sd(reinterpret_cast<double*>(dest + i * 2), _mm_castps_pd(res));
+
+                pos += step;
+            }
+            for (; i < destFrames; ++i) {
                 UINT32 ipos = static_cast<UINT32>(pos);
                 float frac = (ipos >= srcFrames - 1) ? 0.0f : static_cast<float>(pos - ipos);
                 const float* s0 = src + ipos * 2;
                 const float* s1 = (ipos + 1 < srcFrames) ? (s0 + 2) : s0;
-                __m128 v0 = _mm_castsi128_ps(_mm_loadl_epi64((const __m128i*)s0));
-                __m128 v1 = _mm_castsi128_ps(_mm_loadl_epi64((const __m128i*)s1));
+
+                __m128 v0 = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(s0)));
+                __m128 v1 = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(s1)));
                 __m128 f = _mm_set1_ps(frac);
-                __m128 omf = _mm_sub_ps(_mm_set1_ps(1.0f), f);
+                __m128 omf = _mm_sub_ps(one, f);
                 __m128 res = _mm_add_ps(_mm_mul_ps(v0, omf), _mm_mul_ps(v1, f));
-                _mm_store_sd((double*)(dest + i * 2), _mm_castps_pd(res));
+                _mm_store_sd(reinterpret_cast<double*>(dest + i * 2), _mm_castps_pd(res));
 
                 pos += step;
             }
@@ -171,11 +193,41 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
 
         //SSE2 for channels >= 4
         if (g_hasSSE2) {
-            for (UINT32 i = 0; i < destFrames; ++i) {
+            const __m128 one = _mm_set1_ps(1.0f);
+            UINT32 i = 0;
+
+            UINT32 mainDestFrames = 0;
+            if (srcFrames > 1) {
+                double maxMainFrames = static_cast<double>(srcFrames - 1) * ratio;
+                mainDestFrames = (maxMainFrames < destFrames) ? static_cast<UINT32>(maxMainFrames) : destFrames;
+            }
+
+            for (; i < mainDestFrames; ++i) {
+                UINT32 ipos = static_cast<UINT32>(pos);
+                float frac = static_cast<float>(pos - ipos);
+                __m128 f = _mm_set1_ps(frac);
+                __m128 omf = _mm_sub_ps(one, f);
+                const float* s0 = src + ipos * channels;
+                const float* s1 = s0 + channels;
+
+                UINT32 c = 0;
+                for (; c + 4 <= channels; c += 4) {
+                    __m128 v0 = _mm_loadu_ps(s0 + c);
+                    __m128 v1 = _mm_loadu_ps(s1 + c);
+                    __m128 res = _mm_add_ps(_mm_mul_ps(v0, omf), _mm_mul_ps(v1, f));
+                    _mm_storeu_ps(dest + i * channels + c, res);
+                }
+                for (; c < channels; ++c) {
+                    dest[i * channels + c] = s0[c] * (1.0f - frac) + s1[c] * frac;
+                }
+                pos += step;
+            }
+
+            for (; i < destFrames; ++i) {
                 UINT32 ipos = static_cast<UINT32>(pos);
                 float frac = (ipos >= srcFrames - 1) ? 0.0f : static_cast<float>(pos - ipos);
                 __m128 f = _mm_set1_ps(frac);
-                __m128 omf = _mm_sub_ps(_mm_set1_ps(1.0f), f);
+                __m128 omf = _mm_sub_ps(one, f);
                 const float* s0 = src + ipos * channels;
                 const float* s1 = (ipos + 1 < srcFrames) ? (s0 + channels) : s0;
 
@@ -186,14 +238,11 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
                     __m128 res = _mm_add_ps(_mm_mul_ps(v0, omf), _mm_mul_ps(v1, f));
                     _mm_storeu_ps(dest + i * channels + c, res);
                 }
-
-                //Remaining channels
                 for (; c < channels; ++c) {
                     const float v0 = s0[c];
                     const float v1 = (ipos + 1 < srcFrames) ? s1[c] : v0;
                     dest[i * channels + c] = v0 * (1.0f - frac) + v1 * frac;
                 }
-
                 pos += step;
             }
             return;
@@ -203,7 +252,6 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
         for (UINT32 i = 0; i < destFrames; ++i) {
             UINT32 ipos = static_cast<UINT32>(pos);
             float frac = (ipos >= srcFrames - 1) ? 0.0f : static_cast<float>(pos - ipos);
-
             for (UINT32 c = 0; c < channels; ++c) {
                 const float s0 = src[ipos * channels + c];
                 const float s1 = (ipos + 1 < srcFrames) ? src[(ipos + 1) * channels + c] : s0;
@@ -294,14 +342,20 @@ static void ConvertToFloat16(const int16_t* src, float* destFloat, UINT32 sample
     {
         __m128 scale = _mm_set1_ps(1.0f / 32768.0f);
         UINT32 i = 0;
-        for (; i + 4 <= samples; i += 4)
+        for (; i + 8 <= samples; i += 8)
         {
-            __m128i v = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + i));
+            __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
             __m128i sign = _mm_srai_epi16(v, 15);
-            __m128i v32 = _mm_unpacklo_epi16(v, sign);
-            __m128 f = _mm_cvtepi32_ps(v32);
-            f = _mm_mul_ps(f, scale);
-            _mm_storeu_ps(destFloat + i, f);
+            __m128i v_low = _mm_unpacklo_epi16(v, sign);
+            __m128i v_high = _mm_unpackhi_epi16(v, sign);
+            __m128 f_low = _mm_cvtepi32_ps(v_low);
+            __m128 f_high = _mm_cvtepi32_ps(v_high);
+
+            f_low = _mm_mul_ps(f_low, scale);
+            f_high = _mm_mul_ps(f_high, scale);
+
+            _mm_storeu_ps(destFloat + i, f_low);
+            _mm_storeu_ps(destFloat + i + 4, f_high);
         }
         for (; i < samples; ++i)
             destFloat[i] = static_cast<float>(src[i]) / 32768.0f;
@@ -319,22 +373,26 @@ static void ConvertFromFloat16(const float* fSrc, int16_t* dest, UINT32 samples)
     {
         __m128 scale = _mm_set1_ps(32768.0f);
         UINT32 i = 0;
-        for (; i + 4 <= samples; i += 4)
+        for (; i + 8 <= samples; i += 8)
         {
-            __m128 f = _mm_loadu_ps(fSrc + i);
-            f = _mm_mul_ps(f, scale);
-            __m128i i32 = _mm_cvtps_epi32(f);
-            __m128i packed = _mm_packs_epi32(i32, _mm_setzero_si128());
-            _mm_storel_epi64(reinterpret_cast<__m128i*>(dest + i), packed);
+            __m128 f0 = _mm_loadu_ps(fSrc + i);
+            __m128 f1 = _mm_loadu_ps(fSrc + i + 4);
+
+            f0 = _mm_mul_ps(f0, scale);
+            f1 = _mm_mul_ps(f1, scale);
+
+            __m128i i32_0 = _mm_cvtps_epi32(f0);
+            __m128i i32_1 = _mm_cvtps_epi32(f1);
+            __m128i packed = _mm_packs_epi32(i32_0, i32_1);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dest + i), packed);
         }
 
-        //fallback
         for (; i < samples; ++i)
         {
             float v = fSrc[i] * 32768.0f;
             if (v > 32767.0f) v = 32767.0f;
             else if (v < -32768.0f) v = -32768.0f;
-            dest[i] = static_cast<int16_t>(std::round(v));
+            dest[i] = static_cast<int16_t>(v >= 0.0f ? (v + 0.5f) : (v - 0.5f));
         }
     }
     else
@@ -344,7 +402,7 @@ static void ConvertFromFloat16(const float* fSrc, int16_t* dest, UINT32 samples)
             float v = fSrc[i] * 32768.0f;
             if (v > 32767.0f) v = 32767.0f;
             else if (v < -32768.0f) v = -32768.0f;
-            dest[i] = static_cast<int16_t>(std::round(v));
+            dest[i] = static_cast<int16_t>(v >= 0.0f ? (v + 0.5f) : (v - 0.5f));
         }
     }
 }
@@ -842,7 +900,6 @@ void MyDeviceEnumerator::FeedLoopback(const BYTE* pData, UINT32 numFrames, const
 
     UINT32 bytesToWrite;
     BYTE* writeData = nullptr;
-    vector<BYTE> tempWrite;
 
     if (formatsMatch)
     {
@@ -851,25 +908,20 @@ void MyDeviceEnumerator::FeedLoopback(const BYTE* pData, UINT32 numFrames, const
     }
     else
     {
-        // use static memory able to be reused
-        static vector<float> s_fSrc;
-        static vector<float> s_fDest;
-        static vector<BYTE> s_tempWrite;
-
         UINT32 srcSamples = numFrames * srcChannels;
-        if (s_fSrc.size() < srcSamples) s_fSrc.resize(srcSamples);
-        ConvertToFloat(pData, srcFmt, s_fSrc.data(), numFrames);
+        if (m_loopFRaw.size() < srcSamples) m_loopFRaw.resize(srcSamples);
+        ConvertToFloat(pData, srcFmt, m_loopFRaw.data(), numFrames);
 
         UINT32 destSamples = destFrames * loopChannels;
-        if (s_fDest.size() < destSamples) s_fDest.resize(destSamples);
-        ResampleFloat(s_fSrc.data(), srcChannels, numFrames, s_fDest.data(), loopChannels, destFrames, ratio);
+        if (m_loopFDest.size() < destSamples) m_loopFDest.resize(destSamples);
+        ResampleFloat(m_loopFRaw.data(), srcChannels, numFrames, m_loopFDest.data(), loopChannels, destFrames, ratio);
 
         UINT32 tempWriteSize = destFrames * loopFormat.Format.nBlockAlign;
-        if (s_tempWrite.size() < tempWriteSize) s_tempWrite.resize(tempWriteSize);
-        ConvertFromFloat(s_fDest.data(), loopFormat, s_tempWrite.data(), destFrames);
+        if (m_tempWrite.size() < tempWriteSize) m_tempWrite.resize(tempWriteSize);
+        ConvertFromFloat(m_loopFDest.data(), loopFormat, m_tempWrite.data(), destFrames);
 
         bytesToWrite = tempWriteSize;
-        writeData = s_tempWrite.data();
+        writeData = m_tempWrite.data();
     }
 
     UINT64 addedFrames = formatsMatch ? static_cast<UINT64>(numFrames) : static_cast<UINT64>(destFrames);
@@ -1325,13 +1377,14 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     if (bufferDuration == 0) return AUDCLNT_E_BUFFER_SIZE_ERROR;
     bufferFrames = static_cast<UINT32>(((bufferDuration * static_cast<REFERENCE_TIME>(rate)) + 5000000LL) / 10000000LL);
     if (bufferFrames == 0) return AUDCLNT_E_BUFFER_SIZE_ERROR;
+
     if (!isLoopback) {
         UINT32 minSafeFrames = 2048U;
-        if (lowLatencyShared && periodFrames > 0) {
-            bufferFrames = std::max({ bufferFrames * 4, periodFrames * 4, minSafeFrames });
+        if (lowLatencyShared && periodFrames > 0) {.
+            bufferFrames = std::max({ bufferFrames, periodFrames * 4, minSafeFrames });
         }
         else {
-            bufferFrames = std::max({ bufferFrames * 4, minSafeFrames, 4096U });
+            bufferFrames = std::max({ bufferFrames, minSafeFrames, 4096U });
         }
     }
 
@@ -1691,13 +1744,10 @@ HRESULT __stdcall MyAudioClient::Start()
     {
         if (!dsBuffer) return AUDCLNT_E_NOT_INITIALIZED;
 
-        dsBuffer->SetCurrentPosition(0);
-        FillSilence();
-
         HRESULT hr = dsBuffer->Play(0, 0, DSBPLAY_LOOPING);
         if (FAILED(hr)) return hr;
 
-        //force to update position (kickstart logic)
+        // force to update position (kickstart logic)
         {
             EnterCriticalSection(&cs);
             UINT32 dummy = 0;
@@ -1723,16 +1773,14 @@ HRESULT __stdcall MyAudioClient::Start()
                 if (numPositions < 6) numPositions = 6;
                 if (numPositions > 64) numPositions = 64;
 
+                stepBytes = bufferBytes / numPositions;
+
                 std::vector<DSBPOSITIONNOTIFY> pos(numPositions);
                 for (UINT32 i = 0; i < numPositions; ++i)
                 {
-                    pos[i].dwOffset = (i * stepBytes) % bufferBytes;
+                    pos[i].dwOffset = i * stepBytes;
                     pos[i].hEventNotify = notifyEvent;
                 }
-
-
-                if (numPositions >= 2)
-                    pos[0].dwOffset = std::min<DWORD>(1024, stepBytes / 2);
 
                 HRESULT hrNotify = dsNotify->SetNotificationPositions(numPositions, &pos[0]);
                 if (FAILED(hrNotify))
@@ -2183,15 +2231,52 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
         if (IsFloatFormat(format))
         {
             const float* fData = reinterpret_cast<const float*>(data);
-            for (UINT32 i = 0; i < frames; ++i)
+
+            if (g_hasSSE2 && channels == 2)
             {
-                UINT32 base = i * channels;
-                for (UINT32 c = 0; c < channels; ++c)
+                __m128 max_v = _mm_setzero_ps();
+                __m128 sign_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+                UINT32 i = 0;
+                for (; i + 4 <= frames; i += 4)
                 {
-                    float val = fData[base + c];
-                    float absV = fabsf(val);
-                    if (absV > maxPeak) maxPeak = absV;
-                    if (absV > chPeaks[c]) chPeaks[c] = absV;
+                    __m128 v0 = _mm_loadu_ps(fData + i * 2);
+                    __m128 v1 = _mm_loadu_ps(fData + i * 2 + 4);
+                    __m128 abs_v0 = _mm_and_ps(v0, sign_mask);
+                    __m128 abs_v1 = _mm_and_ps(v1, sign_mask);
+                    max_v = _mm_max_ps(max_v, abs_v0);
+                    max_v = _mm_max_ps(max_v, abs_v1);
+                }
+
+                float peaks[4];
+                _mm_storeu_ps(peaks, max_v);
+                float peakL = std::max(peaks[0], peaks[2]);
+                float peakR = std::max(peaks[1], peaks[3]);
+                chPeaks[0] = std::max(chPeaks[0], peakL);
+                chPeaks[1] = std::max(chPeaks[1], peakR);
+                maxPeak = std::max({ maxPeak, peakL, peakR });
+                for (; i < frames; ++i)
+                {
+                    float absL = fabsf(fData[i * 2]);
+                    float absR = fabsf(fData[i * 2 + 1]);
+                    if (absL > chPeaks[0]) chPeaks[0] = absL;
+                    if (absR > chPeaks[1]) chPeaks[1] = absR;
+                    if (absL > maxPeak) maxPeak = absL;
+                    if (absR > maxPeak) maxPeak = absR;
+                }
+            }
+            else
+            {
+                //scalar fallback
+                for (UINT32 i = 0; i < frames; ++i)
+                {
+                    UINT32 base = i * channels;
+                    for (UINT32 c = 0; c < channels; ++c)
+                    {
+                        float val = fData[base + c];
+                        float absV = fabsf(val);
+                        if (absV > maxPeak) maxPeak = absV;
+                        if (absV > chPeaks[c]) chPeaks[c] = absV;
+                    }
                 }
             }
         }
@@ -2227,31 +2312,49 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
                 float vR = channelVolumes[1];
                 __m128 vol = _mm_set_ps(vR, vL, vR, vL);
 
+                __m128 max_v = _mm_setzero_ps();
+                __m128 sign_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
                 UINT32 i = 0;
-                for (; i + 2 <= frames; i += 2)
+                for (; i + 4 <= frames; i += 4)
                 {
-                    __m128 v = _mm_loadu_ps(fData + i * 2);
-                    __m128 res = _mm_mul_ps(v, vol);
-                    _mm_storeu_ps(fData + i * 2, res);
+                    __m128 v0 = _mm_loadu_ps(fData + i * 2);
+                    __m128 v1 = _mm_loadu_ps(fData + i * 2 + 4);
 
-                    float absL = fabsf(fData[i * 2]);
-                    float absR = fabsf(fData[i * 2 + 1]);
-                    if (absL > maxPeak) maxPeak = absL;
-                    if (absR > maxPeak) maxPeak = absR;
-                    if (absL > chPeaks[0]) chPeaks[0] = absL;
-                    if (absR > chPeaks[1]) chPeaks[1] = absR;
+                    __m128 res0 = _mm_mul_ps(v0, vol);
+                    __m128 res1 = _mm_mul_ps(v1, vol);
+
+                    _mm_storeu_ps(fData + i * 2, res0);
+                    _mm_storeu_ps(fData + i * 2 + 4, res1);
+
+                    __m128 abs_v0 = _mm_and_ps(res0, sign_mask);
+                    __m128 abs_v1 = _mm_and_ps(res1, sign_mask);
+
+                    max_v = _mm_max_ps(max_v, abs_v0);
+                    max_v = _mm_max_ps(max_v, abs_v1);
                 }
+
+                float peaks[4];
+                _mm_storeu_ps(peaks, max_v);
+                float peakL = std::max(peaks[0], peaks[2]);
+                float peakR = std::max(peaks[1], peaks[3]);
+
+                chPeaks[0] = std::max(chPeaks[0], peakL);
+                chPeaks[1] = std::max(chPeaks[1], peakR);
+                maxPeak = std::max({ maxPeak, peakL, peakR });
+
                 for (; i < frames; ++i)
                 {
                     UINT32 base = i * 2;
                     fData[base] *= vL;
                     fData[base + 1] *= vR;
+
                     float absL = fabsf(fData[base]);
                     float absR = fabsf(fData[base + 1]);
-                    if (absL > maxPeak) maxPeak = absL;
-                    if (absR > maxPeak) maxPeak = absR;
+
                     if (absL > chPeaks[0]) chPeaks[0] = absL;
                     if (absR > chPeaks[1]) chPeaks[1] = absR;
+                    if (absL > maxPeak) maxPeak = absL;
+                    if (absR > maxPeak) maxPeak = absR;
                 }
             }
             else
