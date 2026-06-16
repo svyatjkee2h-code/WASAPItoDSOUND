@@ -13,6 +13,8 @@
 #include <emmintrin.h>
 #include "wrapper.h"
 
+MyDeviceEnumerator* g_enumerator = nullptr;
+
 bool g_blacklisted = false;
 bool g_hasSSE2 = false;
 
@@ -49,7 +51,22 @@ using std::vector;
 using std::wstring;
 
 HINSTANCE g_hInstance = NULL;
-MyDeviceEnumerator* g_enumerator = nullptr;
+
+MyDeviceEnumerator* GetGlobalEnumerator()
+{
+    if (!g_enumerator && !g_blacklisted)
+    {
+        MyDeviceEnumerator* pTemp = new (std::nothrow) MyDeviceEnumerator();
+        if (pTemp)
+        {
+            if (InterlockedCompareExchangePointer(reinterpret_cast<PVOID*>(&g_enumerator), pTemp, NULL) != NULL)
+            {
+                delete pTemp;
+            }
+        }
+    }
+    return g_enumerator;
+}
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
 {
@@ -61,10 +78,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
         g_blacklisted = IsBlacklistApp();
         InitSIMD();
-
-        if (!g_blacklisted)
-            g_enumerator = new MyDeviceEnumerator();
-
         break;
 
     case DLL_PROCESS_DETACH:
@@ -161,6 +174,10 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
             }
             for (; i < mainDestFrames; ++i) {
                 UINT32 ipos = static_cast<UINT32>(pos);
+                if (ipos >= srcFrames - 1) {
+                    break;
+                }
+
                 float frac = static_cast<float>(pos - ipos);
                 const float* s0 = src + ipos * 2;
 
@@ -195,7 +212,6 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
         if (g_hasSSE2) {
             const __m128 one = _mm_set1_ps(1.0f);
             UINT32 i = 0;
-
             UINT32 mainDestFrames = 0;
             if (srcFrames > 1) {
                 double maxMainFrames = static_cast<double>(srcFrames - 1) * ratio;
@@ -204,6 +220,11 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
 
             for (; i < mainDestFrames; ++i) {
                 UINT32 ipos = static_cast<UINT32>(pos);
+
+                if (ipos >= srcFrames - 1) {
+                    break;
+                }
+
                 float frac = static_cast<float>(pos - ipos);
                 __m128 f = _mm_set1_ps(frac);
                 __m128 omf = _mm_sub_ps(one, f);
@@ -804,45 +825,74 @@ HRESULT __stdcall MyDeviceEnumerator::GetDevice(const wchar_t* pwstrId, IMMDevic
 
 HRESULT __stdcall MyDeviceEnumerator::RegisterEndpointNotificationCallback(IMMNotificationClient* pClient) {
     if (pClient == NULL) return E_POINTER;
+
+    EnterCriticalSection(&volumeCS);
     auto it = std::find(clients.begin(), clients.end(), pClient);
-    if (it != clients.end()) return S_OK;
+    if (it != clients.end()) {
+        LeaveCriticalSection(&volumeCS);
+        return S_OK;
+    }
     pClient->AddRef();
     clients.push_back(pClient);
+    LeaveCriticalSection(&volumeCS);
     return S_OK;
 }
 
 HRESULT __stdcall MyDeviceEnumerator::UnregisterEndpointNotificationCallback(IMMNotificationClient* pClient) {
     if (pClient == NULL) return E_POINTER;
+
+    EnterCriticalSection(&volumeCS);
     auto it = std::find(clients.begin(), clients.end(), pClient);
-    if (it == clients.end()) return S_OK;
+    if (it == clients.end()) {
+        LeaveCriticalSection(&volumeCS);
+        return S_OK;
+    }
+    IMMNotificationClient* pFound = *it;
     clients.erase(it);
-    (*it)->Release();
+    pFound->Release();
+    LeaveCriticalSection(&volumeCS);
     return S_OK;
 }
 
 MyAudioSession* MyDeviceEnumerator::GetSession(const GUID& guid, bool create) {
+    EnterCriticalSection(&volumeCS);
     for (auto s : sessions) {
-        if (IsEqualGUID(s->guid, guid)) return s;
+        if (IsEqualGUID(s->guid, guid)) {
+            LeaveCriticalSection(&volumeCS);
+            return s;
+        }
     }
-    if (!create) return nullptr;
-    MyAudioSession* s = new MyAudioSession();
-    s->guid = guid;
-    s->volume = 1.0f;
-    s->mute = false;
-    s->state = AudioSessionStateActive;
-    sessions.push_back(s);
+    if (!create) {
+        LeaveCriticalSection(&volumeCS);
+        return nullptr;
+    }
+    MyAudioSession* s = new (std::nothrow) MyAudioSession();
+    if (s) {
+        s->guid = guid;
+        s->volume = 1.0f;
+        s->mute = false;
+        s->state = AudioSessionStateActive;
+        sessions.push_back(s);
+    }
+    LeaveCriticalSection(&volumeCS);
     return s;
 }
 
 void MyDeviceEnumerator::RemoveSession(MyAudioSession* s) {
+    EnterCriticalSection(&volumeCS);
     auto it = std::find(sessions.begin(), sessions.end(), s);
-    if (it != sessions.end()) sessions.erase(it);
+    if (it != sessions.end()) {
+        sessions.erase(it);
+    }
+    LeaveCriticalSection(&volumeCS);
 }
 
 void MyDeviceEnumerator::UpdateAllVolumes() {
+    EnterCriticalSection(&volumeCS);
     for (auto s : sessions) {
         s->UpdateVolumes();
     }
+    LeaveCriticalSection(&volumeCS);
 }
 
 void MyDeviceEnumerator::NotifyVolumeChange(const GUID* context) {
@@ -4304,6 +4354,8 @@ extern "C" {
         if (!IsEqualCLSID(rclsid, CLSID_MMDeviceEnumerator))
             return CLASS_E_CLASSNOTAVAILABLE;
 
+        GetGlobalEnumerator();
+
         MyClassFactory* factory = new MyClassFactory();
         if (factory == nullptr) return E_OUTOFMEMORY;
 
@@ -4376,6 +4428,9 @@ extern "C" {
     STDAPI ActivateAudioInterfaceAsync(LPCWSTR deviceInterfacePath, REFIID riid, PROPVARIANT* activationParams, IActivateAudioInterfaceCompletionHandler* completionHandler, IActivateAudioInterfaceAsyncOperation** asyncOp) {
         if (deviceInterfacePath == NULL || completionHandler == NULL || asyncOp == NULL) return E_POINTER;
         *asyncOp = NULL;
+
+        GetGlobalEnumerator();
+
         MyActivateAudioInterfaceAsyncOperation* op = new MyActivateAudioInterfaceAsyncOperation(deviceInterfacePath, riid, activationParams, completionHandler);
         if (op == NULL) return E_OUTOFMEMORY;
         *asyncOp = op;
