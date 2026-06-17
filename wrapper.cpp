@@ -1398,7 +1398,6 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
 
     if (ShareMode == AUDCLNT_SHAREMODE_SHARED) {
         const REFERENCE_TIME MIN_BUFFER_DURATION = 1000000;
-
         if (hnsBufferDuration == 0) hnsBufferDuration = 1000000;
         if (hnsBufferDuration < MIN_BUFFER_DURATION) {
             hnsBufferDuration = MIN_BUFFER_DURATION;
@@ -1428,19 +1427,25 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     bufferFrames = static_cast<UINT32>(((bufferDuration * static_cast<REFERENCE_TIME>(rate)) + 5000000LL) / 10000000LL);
     if (bufferFrames == 0) return AUDCLNT_E_BUFFER_SIZE_ERROR;
 
+    UINT32 dsBufferFrames = bufferFrames;
     if (!isLoopback) {
-        UINT32 minSafeFrames = 2048U;
-        if (lowLatencyShared && periodFrames > 0) {
-            bufferFrames = std::max({ bufferFrames, periodFrames * 4, minSafeFrames });
+        if (ShareMode == AUDCLNT_SHAREMODE_EXCLUSIVE && (StreamFlags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK)) {
+            // Двойная буферизация для предотвращения опустошения
+            dsBufferFrames = bufferFrames * 2;
         }
         else {
-            bufferFrames = std::max({ bufferFrames, minSafeFrames, 4096U });
+            UINT32 minSafeFrames = 2048U;
+            if (lowLatencyShared && periodFrames > 0) {
+                dsBufferFrames = std::max({ bufferFrames, periodFrames * 4, minSafeFrames });
+            }
+            else {
+                dsBufferFrames = std::max({ bufferFrames, minSafeFrames, 4096U });
+            }
         }
     }
 
-    bufferBytes = bufferFrames * blockAlign;
-
-    m_applyTemp.resize(bufferFrames * format.Format.nChannels);
+    bufferBytes = dsBufferFrames * blockAlign;
+    m_applyTemp.resize(dsBufferFrames * format.Format.nChannels);
 
     WAVEFORMATEX dsFormat = *pFormat;
     bool isExtensible = (pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE);
@@ -1467,7 +1472,7 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         if (ShareMode == AUDCLNT_SHAREMODE_EXCLUSIVE)
         {
             IDirectSoundBuffer* primary = NULL;
-            DSBUFFERDESC pdsbd = { sizeof(DSBUFFERDESC), DSBCAPS_PRIMARYBUFFER, 0, 0, NULL, {0} };
+            DSBUFFERDESC pdsbd = { sizeof(DSBUFFERDESC), DSBCAPS_PRIMARYBUFFER | DSBCAPS_LOCHARDWARE, 0, 0, NULL, {0} };
             hr = ds->CreateSoundBuffer(&pdsbd, &primary, NULL);
             if (SUCCEEDED(hr))
             {
@@ -1617,10 +1622,16 @@ HRESULT __stdcall MyAudioClient::GetCurrentPadding(UINT32* pNumPaddingFrames)
             (double)rate / (double)g_enumerator->loopFormat.Format.nSamplesPerSec;
 
         UINT64 paddingFrames = static_cast<UINT64>(loopPadFrames * ratio + 0.5);
-        if (paddingFrames > bufferFrames)
-            paddingFrames = bufferFrames;
+        UINT32 dsBufferFrames = bufferBytes / blockAlign;
+
+        if (paddingFrames > dsBufferFrames)
+            paddingFrames = dsBufferFrames;
 
         *pNumPaddingFrames = static_cast<UINT32>(paddingFrames);
+
+        if (shareMode == AUDCLNT_SHAREMODE_EXCLUSIVE && *pNumPaddingFrames > bufferFrames) {
+            *pNumPaddingFrames = bufferFrames;
+        }
 
         LeaveCriticalSection(&g_enumerator->loopCS);
         return S_OK;
@@ -1632,7 +1643,12 @@ HRESULT __stdcall MyAudioClient::GetCurrentPadding(UINT32* pNumPaddingFrames)
     LeaveCriticalSection(&cs);
 
     if (FAILED(hr)) return hr;
+
     *pNumPaddingFrames = padding;
+    if (shareMode == AUDCLNT_SHAREMODE_EXCLUSIVE && *pNumPaddingFrames > bufferFrames) {
+        *pNumPaddingFrames = bufferFrames;
+    }
+
     return S_OK;
 }
 
@@ -1663,7 +1679,8 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
         if (loopPad > loopCapacityFrames) loopPad = loopCapacityFrames;
         const double ratio = (double)rate / (double)g_enumerator->loopFormat.Format.nSamplesPerSec;
         UINT64 convertedPadding = static_cast<UINT64>(loopPad * ratio + 0.5);
-        if (convertedPadding > bufferFrames) convertedPadding = bufferFrames;
+        UINT32 dsBufferFrames = bufferBytes / blockAlign;
+        if (convertedPadding > dsBufferFrames) convertedPadding = dsBufferFrames;
         *padding = static_cast<UINT32>(convertedPadding);
         devicePositionFrames = static_cast<UINT64>(g_enumerator->loopPositionFrames * ratio + 0.5);
         LeaveCriticalSection(&g_enumerator->loopCS);
@@ -1709,6 +1726,7 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
     devicePositionFrames += deltaFrames;
 
     prevPos = curPos;
+    UINT32 dsBufferFrames = bufferBytes / blockAlign;
 
     if (flow == eRender)
     {
@@ -1716,8 +1734,8 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
         UINT32 queuedBytes = (writePosBytes >= curPos) ? (writePosBytes - curPos) : (bufferBytes - curPos + writePosBytes);
         currentPaddingFrames = queuedBytes / blockAlign;
 
-        if (currentPaddingFrames > bufferFrames)
-            currentPaddingFrames = bufferFrames;
+        if (currentPaddingFrames > dsBufferFrames)
+            currentPaddingFrames = dsBufferFrames;
 
         UINT64 playedFrames = devicePositionFrames;
 
@@ -1734,7 +1752,6 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
     }
     else
     {
-        //DirectSound capture
         UINT32 readPosBytes = static_cast<UINT32>(lastPos % bufferBytes);
         UINT32 availableBytes =
             (curPos >= readPosBytes)
@@ -1743,8 +1760,8 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
 
         currentPaddingFrames = availableBytes / blockAlign;
 
-        if (currentPaddingFrames > bufferFrames)
-            currentPaddingFrames = bufferFrames;
+        if (currentPaddingFrames > dsBufferFrames)
+            currentPaddingFrames = dsBufferFrames;
     }
 
     *padding = currentPaddingFrames;
@@ -2088,9 +2105,16 @@ DWORD WINAPI MyAudioClient::MonitorThread(LPVOID lpParam)
         if (self->hEvent)
         {
             bool shouldSignal = false;
+            UINT32 dsBufferFrames = self->bufferBytes / self->blockAlign;
+
             if (self->flow == eRender && !self->isLoopback)
             {
-                shouldSignal = (pad < (self->bufferFrames / 2));
+                if (self->shareMode == AUDCLNT_SHAREMODE_EXCLUSIVE && self->isEventDriven) {
+                    shouldSignal = (pad <= dsBufferFrames - self->bufferFrames);
+                }
+                else {
+                    shouldSignal = (pad < (dsBufferFrames / 2));
+                }
             }
             else
             {
@@ -2520,12 +2544,14 @@ HRESULT __stdcall MyRenderClient::GetBuffer(UINT32 NumFramesRequested, BYTE** pp
         padding = 0;
     }
 
-    UINT32 availableFrames = (parent->bufferFrames > padding) ? (parent->bufferFrames - padding) : 0;
+    UINT32 dsBufferFrames = parent->bufferBytes / parent->blockAlign;
+    UINT32 availableFrames = (dsBufferFrames > padding) ? (dsBufferFrames - padding) : 0;
+
     if (NumFramesRequested > availableFrames)
     {
-        if (parent->totalWrittenFrames == 0 && NumFramesRequested <= parent->bufferFrames)
+        if (parent->totalWrittenFrames == 0 && NumFramesRequested <= dsBufferFrames)
         {
-            availableFrames = parent->bufferFrames;
+            availableFrames = dsBufferFrames;
         }
         else
         {
@@ -2620,9 +2646,11 @@ HRESULT __stdcall MyRenderClient::ReleaseBuffer(UINT32 NumFramesWritten, DWORD d
         (fullBytes > parent->lockL1 && parent->lockP2) ? (fullBytes - parent->lockL1) : 0);
 
     UINT32 writtenBytes = writtenFrames * parent->blockAlign;
+    UINT32 dsBufferFrames = parent->bufferBytes / parent->blockAlign;
+
     parent->lastPos += writtenBytes;
-    parent->currentPaddingFrames = (parent->currentPaddingFrames + writtenFrames > parent->bufferFrames)
-        ? parent->bufferFrames
+    parent->currentPaddingFrames = (parent->currentPaddingFrames + writtenFrames > dsBufferFrames)
+        ? dsBufferFrames
         : (parent->currentPaddingFrames + writtenFrames);
 
     parent->totalWrittenFrames += writtenFrames;
@@ -2727,9 +2755,10 @@ HRESULT __stdcall MyCaptureClient::GetBuffer(BYTE** ppData, UINT32* pNumFramesTo
         double ratio = (double)parent->rate / g_enumerator->loopFormat.Format.nSamplesPerSec;
         UINT32 frames = static_cast<UINT32>(loopPadFrames64 * ratio + 0.5);
 
-        if (frames > parent->bufferFrames)
+        UINT32 dsBufferFrames = parent->bufferBytes / parent->blockAlign;
+        if (frames > dsBufferFrames)
         {
-            frames = parent->bufferFrames;
+            frames = dsBufferFrames;
             loopPadFrames64 = static_cast<UINT64>(frames / ratio + 0.5);
         }
 
