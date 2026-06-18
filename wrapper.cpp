@@ -1397,6 +1397,11 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     }
 
     if (ShareMode == AUDCLNT_SHAREMODE_SHARED) {
+        const REFERENCE_TIME MIN_PERIODICITY = 300000;
+        if (hnsPeriodicity > 0 && hnsPeriodicity < MIN_PERIODICITY) {
+            hnsPeriodicity = MIN_PERIODICITY;
+        }
+
         const REFERENCE_TIME MIN_BUFFER_DURATION = 1000000;
         if (hnsBufferDuration == 0) hnsBufferDuration = 1000000;
         if (hnsBufferDuration < MIN_BUFFER_DURATION) {
@@ -1461,7 +1466,6 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         hr = DirectSoundCreate8(IsEqualGUID(deviceGuid, GUID_NULL) ? NULL : &deviceGuid, &ds, NULL);
         if (FAILED(hr)) return hr;
 
-        // Try forcing Primary Buffer
         DWORD coopLevel = (ShareMode == AUDCLNT_SHAREMODE_SHARED) ? DSSCL_PRIORITY : DSSCL_EXCLUSIVE;
         hr = ds->SetCooperativeLevel(GetDesktopWindow(), coopLevel);
         if (FAILED(hr)) return hr;
@@ -1472,7 +1476,6 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         {
             HRESULT hrPrimFormat = primary->SetFormat(&dsFormat);
 
-            // Set to 16-bit PCM in order to fix hardware mixing issues
             if (FAILED(hrPrimFormat) && dsFormat.wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
             {
                 WAVEFORMATEX pcmFormat = dsFormat;
@@ -1491,19 +1494,16 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
 
         IDirectSoundBuffer* temp = NULL;
 
-        // Secondary buffer
         DSBUFFERDESC dsbd = { sizeof(DSBUFFERDESC), dwFlags | DSBCAPS_LOCHARDWARE, bufferBytes, 0, NULL, {0} };
         dsbd.lpwfxFormat = &dsFormat;
         hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
 
-        // fallback to Software with DSBCAPS_CTRLFX
         if (FAILED(hr))
         {
             dsbd.dwFlags = dwFlags | DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLFX;
             hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
         }
 
-        // fallback to Software
         if (FAILED(hr))
         {
             dsbd.dwFlags = dwFlags | DSBCAPS_LOCSOFTWARE;
@@ -1818,8 +1818,11 @@ HRESULT __stdcall MyAudioClient::GetMixFormat(WAVEFORMATEX** ppDeviceFormat) {
 
 HRESULT __stdcall MyAudioClient::GetDevicePeriod(REFERENCE_TIME* phnsDefaultDevicePeriod, REFERENCE_TIME* phnsMinimumDevicePeriod) {
     if (phnsDefaultDevicePeriod == NULL && phnsMinimumDevicePeriod == NULL) return E_POINTER;
-    if (phnsDefaultDevicePeriod != NULL) *phnsDefaultDevicePeriod = 100000;
-    if (phnsMinimumDevicePeriod != NULL) *phnsMinimumDevicePeriod = 30000;
+
+    // Forcing buffer duration to 30ms
+    if (phnsDefaultDevicePeriod != NULL) *phnsDefaultDevicePeriod = 300000;
+    if (phnsMinimumDevicePeriod != NULL) *phnsMinimumDevicePeriod = 300000;
+
     return S_OK;
 }
 
@@ -2185,9 +2188,10 @@ HRESULT __stdcall MyAudioClient::GetBufferSizeLimits(const WAVEFORMATEX* pFormat
 HRESULT __stdcall MyAudioClient::GetSharedModeEnginePeriod(const WAVEFORMATEX* pFormat, UINT32* pDefaultPeriodInFrames, UINT32* pFundamentalPeriodInFrames, UINT32* pMinPeriodInFrames, UINT32* pMaxPeriodInFrames) {
     if (pFormat == NULL || pDefaultPeriodInFrames == NULL || pFundamentalPeriodInFrames == NULL || pMinPeriodInFrames == NULL || pMaxPeriodInFrames == NULL) return E_POINTER;
     UINT32 r = pFormat->nSamplesPerSec ? pFormat->nSamplesPerSec : (rate ? rate : 48000);
-    *pDefaultPeriodInFrames = r / 100;
-    *pFundamentalPeriodInFrames = r / 1000;
-    *pMinPeriodInFrames = r / 1000;
+
+    *pDefaultPeriodInFrames = (r * 30) / 1000;
+    *pFundamentalPeriodInFrames = (r * 10) / 1000;
+    *pMinPeriodInFrames = (r * 30) / 1000;
     *pMaxPeriodInFrames = r / 10;
     return S_OK;
 }
@@ -2218,9 +2222,18 @@ HRESULT __stdcall MyAudioClient::GetCurrentSharedModeEnginePeriod(WAVEFORMATEX**
 }
 
 HRESULT __stdcall MyAudioClient::InitializeSharedAudioStream(DWORD StreamFlags, UINT32 PeriodInFrames, const WAVEFORMATEX* pFormat, const GUID* AudioSessionGuid) {
+    if (pFormat == NULL) return E_POINTER;
+
+    // Forcing 30ms buffer duration
+    UINT32 minPeriodFrames = (pFormat->nSamplesPerSec * 30) / 1000;
+    if (PeriodInFrames < minPeriodFrames) {
+        PeriodInFrames = minPeriodFrames;
+    }
+
     lowLatencyShared = true;
     REFERENCE_TIME hnsPeriodicity = static_cast<REFERENCE_TIME>(PeriodInFrames) * 10000000LL / pFormat->nSamplesPerSec;
     REFERENCE_TIME hnsBufferDuration = hnsPeriodicity * 4;
+
     return InternalInitialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, hnsBufferDuration, hnsPeriodicity, pFormat, AudioSessionGuid);
 }
 
