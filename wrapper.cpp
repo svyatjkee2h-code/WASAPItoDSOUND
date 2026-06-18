@@ -1471,8 +1471,6 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         if (SUCCEEDED(ds->CreateSoundBuffer(&pdsbd, &primary, NULL)))
         {
             HRESULT hrPrimFormat = primary->SetFormat(&dsFormat);
-
-            // Set to 16-bit PCM in order to fix hardware mixing issues
             if (FAILED(hrPrimFormat) && dsFormat.wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
             {
                 WAVEFORMATEX pcmFormat = dsFormat;
@@ -1485,7 +1483,10 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
             primary->Release();
         }
 
-        DWORD dwFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_CTRLVOLUME;
+        DWORD dwFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 |
+            DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_CTRLVOLUME |
+            DSBCAPS_CTRLFREQUENCY;
+
         IDirectSoundBuffer* temp = NULL;
 
         // Secondary buffer
@@ -1493,7 +1494,14 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         dsbd.lpwfxFormat = &dsFormat;
         hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
 
-        // fallback
+        // fallback to Software with DSBCAPS_CTRLFX
+        if (FAILED(hr))
+        {
+            dsbd.dwFlags = dwFlags | DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLFX;
+            hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
+        }
+
+        // fallback to Software
         if (FAILED(hr))
         {
             dsbd.dwFlags = dwFlags | DSBCAPS_LOCSOFTWARE;
@@ -2216,9 +2224,18 @@ HRESULT __stdcall MyAudioClient::InitializeSharedAudioStream(DWORD StreamFlags, 
 
 void MyAudioClient::UpdateVolume() {
     if (flow != eRender || !dsBuffer || !g_enumerator || !session || isLoopback) return;
+
     float effective = g_enumerator->masterVolume * session->volume;
     bool muted = g_enumerator->masterMute || session->mute;
-    long dsVol = muted || effective <= 0.0001f ? DSBVOLUME_MIN : static_cast<long>(2000.0f * log10f(effective));
+
+    LONG dsVol = DSBVOLUME_MIN; // По умолчанию полная тишина (-10000)
+
+    if (!muted && effective > 0.0001f) {
+        dsVol = static_cast<LONG>(2000.0f * std::log10(effective));
+        if (dsVol > DSBVOLUME_MAX) dsVol = DSBVOLUME_MAX;
+        if (dsVol < DSBVOLUME_MIN) dsVol = DSBVOLUME_MIN;
+    }
+
     dsBuffer->SetVolume(dsVol);
 }
 
@@ -3293,7 +3310,14 @@ ULONG __stdcall MyAudioClockAdjustment::Release() {
 }
 
 HRESULT __stdcall MyAudioClockAdjustment::SetSampleRate(FLOAT fSampleRate) {
-    return S_OK;
+    if (!parent || !parent->dsBuffer) return E_UNEXPECTED;
+
+    DWORD dwFreq = static_cast<DWORD>(fSampleRate);
+
+    if (dwFreq < DSBFREQUENCY_MIN) dwFreq = DSBFREQUENCY_MIN;
+    if (dwFreq > DSBFREQUENCY_MAX) dwFreq = DSBFREQUENCY_MAX;
+
+    return parent->dsBuffer->SetFrequency(dwFreq);
 }
 
 MyDeviceTopology::MyDeviceTopology(const wstring& id) : ref(1), m_pUnkMarshal(nullptr), deviceId(id) {
