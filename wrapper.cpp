@@ -1471,6 +1471,8 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         if (SUCCEEDED(ds->CreateSoundBuffer(&pdsbd, &primary, NULL)))
         {
             HRESULT hrPrimFormat = primary->SetFormat(&dsFormat);
+
+            // Set to 16-bit PCM in order to fix hardware mixing issues
             if (FAILED(hrPrimFormat) && dsFormat.wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
             {
                 WAVEFORMATEX pcmFormat = dsFormat;
@@ -2228,7 +2230,7 @@ void MyAudioClient::UpdateVolume() {
     float effective = g_enumerator->masterVolume * session->volume;
     bool muted = g_enumerator->masterMute || session->mute;
 
-    LONG dsVol = DSBVOLUME_MIN; // По умолчанию полная тишина (-10000)
+    LONG dsVol = DSBVOLUME_MIN;
 
     if (!muted && effective > 0.0001f) {
         dsVol = static_cast<LONG>(2000.0f * std::log10(effective));
