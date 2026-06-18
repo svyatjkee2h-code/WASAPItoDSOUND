@@ -1,4 +1,3 @@
-//wrapper.h
 #define WRAPPER_H
 
 #define NOMINMAX
@@ -221,6 +220,7 @@ private:
     friend class MyAudioClock2;
     friend class MyAudioStreamVolume;
     friend class MyAudioMeterInformation;
+    friend class MyAudioClockAdjustment;
     IUnknown* m_pUnkOuter;
     IUnknown* m_pUnkMarshal;
     LONG ref;
