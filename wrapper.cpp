@@ -1430,7 +1430,6 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     UINT32 dsBufferFrames = bufferFrames;
     if (!isLoopback) {
         if (ShareMode == AUDCLNT_SHAREMODE_EXCLUSIVE && (StreamFlags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK)) {
-            // Двойная буферизация для предотвращения опустошения
             dsBufferFrames = bufferFrames * 2;
         }
         else {
@@ -1462,39 +1461,51 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         hr = DirectSoundCreate8(IsEqualGUID(deviceGuid, GUID_NULL) ? NULL : &deviceGuid, &ds, NULL);
         if (FAILED(hr)) return hr;
 
+        // Try forcing Primary Buffer
         DWORD coopLevel = (ShareMode == AUDCLNT_SHAREMODE_SHARED) ? DSSCL_PRIORITY : DSSCL_EXCLUSIVE;
         hr = ds->SetCooperativeLevel(GetDesktopWindow(), coopLevel);
         if (FAILED(hr)) return hr;
+        IDirectSoundBuffer* primary = NULL;
+        DSBUFFERDESC pdsbd = { sizeof(DSBUFFERDESC), DSBCAPS_PRIMARYBUFFER | DSBCAPS_LOCHARDWARE, 0, 0, NULL, {0} };
 
-        DWORD dwFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_CTRLVOLUME;
-
-        IDirectSoundBuffer* temp = NULL;
-        if (ShareMode == AUDCLNT_SHAREMODE_EXCLUSIVE)
+        if (SUCCEEDED(ds->CreateSoundBuffer(&pdsbd, &primary, NULL)))
         {
-            IDirectSoundBuffer* primary = NULL;
-            DSBUFFERDESC pdsbd = { sizeof(DSBUFFERDESC), DSBCAPS_PRIMARYBUFFER | DSBCAPS_LOCHARDWARE, 0, 0, NULL, {0} };
-            hr = ds->CreateSoundBuffer(&pdsbd, &primary, NULL);
-            if (SUCCEEDED(hr))
+            HRESULT hrPrimFormat = primary->SetFormat(&dsFormat);
+
+            // Set to 16-bit PCM in order to fix hardware mixing issues
+            if (FAILED(hrPrimFormat) && dsFormat.wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
             {
-                hr = primary->SetFormat(&dsFormat);
-                primary->Release();
+                WAVEFORMATEX pcmFormat = dsFormat;
+                pcmFormat.wFormatTag = WAVE_FORMAT_PCM;
+                pcmFormat.wBitsPerSample = 16;
+                pcmFormat.nBlockAlign = (pcmFormat.nChannels * pcmFormat.wBitsPerSample) / 8;
+                pcmFormat.nAvgBytesPerSec = pcmFormat.nSamplesPerSec * pcmFormat.nBlockAlign;
+                primary->SetFormat(&pcmFormat);
             }
-            if (FAILED(hr)) return hr;
+            primary->Release();
         }
 
+        DWORD dwFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_CTRLVOLUME;
+        IDirectSoundBuffer* temp = NULL;
+
+        // Secondary buffer
         DSBUFFERDESC dsbd = { sizeof(DSBUFFERDESC), dwFlags | DSBCAPS_LOCHARDWARE, bufferBytes, 0, NULL, {0} };
         dsbd.lpwfxFormat = &dsFormat;
         hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
+
+        // fallback
         if (FAILED(hr))
         {
-            dsbd.dwFlags = dwFlags;
+            dsbd.dwFlags = dwFlags | DSBCAPS_LOCSOFTWARE;
             hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
         }
+
         if (FAILED(hr) && isExtensible)
         {
             dsbd.lpwfxFormat = const_cast<WAVEFORMATEX*>(pFormat);
             hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
         }
+
         if (FAILED(hr)) return hr;
 
         hr = temp->QueryInterface(IID_IDirectSoundBuffer8, (void**)&dsBuffer);
@@ -2299,13 +2310,15 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
 
     float maxPeak = 0.0f;
     std::vector<float> chPeaks(channels, 0.0f);
+    bool isFloat = IsFloatFormat(format);
+    UINT32 bits = format.Format.wBitsPerSample;
 
-    if (allOne)
+    if (isFloat)
     {
-        if (IsFloatFormat(format))
-        {
-            const float* fData = reinterpret_cast<const float*>(data);
+        float* fData = reinterpret_cast<float*>(data);
 
+        if (allOne)
+        {
             if (g_hasSSE2 && channels == 2)
             {
                 __m128 max_v = _mm_setzero_ps();
@@ -2340,7 +2353,6 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
             }
             else
             {
-                //scalar fallback
                 for (UINT32 i = 0; i < frames; ++i)
                 {
                     UINT32 base = i * channels;
@@ -2356,30 +2368,6 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
         }
         else
         {
-            UINT32 samples = frames * channels;
-            if (samples > m_applyTemp.size()) m_applyTemp.resize(samples);
-            float* fData = m_applyTemp.data();
-            ConvertToFloat(data, format, fData, frames);
-
-            for (UINT32 i = 0; i < frames; ++i)
-            {
-                UINT32 base = i * channels;
-                for (UINT32 c = 0; c < channels; ++c)
-                {
-                    float val = fData[base + c];
-                    float absV = fabsf(val);
-                    if (absV > maxPeak) maxPeak = absV;
-                    if (absV > chPeaks[c]) chPeaks[c] = absV;
-                }
-            }
-        }
-    }
-    else
-    {
-        if (IsFloatFormat(format))
-        {
-            float* fData = reinterpret_cast<float*>(data);
-
             if (g_hasSSE2 && channels == 2)
             {
                 float vL = channelVolumes[0];
@@ -2447,14 +2435,67 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
                 }
             }
         }
+    }
+    else if (bits == 16)
+    {
+        int16_t* p16 = reinterpret_cast<int16_t*>(data);
+        if (allOne)
+        {
+            for (UINT32 i = 0; i < frames; ++i)
+            {
+                UINT32 base = i * channels;
+                for (UINT32 c = 0; c < channels; ++c)
+                {
+                    int val = p16[base + c];
+                    float absV = std::abs(val) * (1.0f / 32768.0f);
+                    if (absV > maxPeak) maxPeak = absV;
+                    if (absV > chPeaks[c]) chPeaks[c] = absV;
+                }
+            }
+        }
         else
         {
-            UINT32 samples = frames * channels;
-            if (samples > m_applyTemp.size()) m_applyTemp.resize(samples);
-            float* fData = m_applyTemp.data();
+            for (UINT32 i = 0; i < frames; ++i)
+            {
+                UINT32 base = i * channels;
+                for (UINT32 c = 0; c < channels; ++c)
+                {
+                    float fVal = static_cast<float>(p16[base + c]) * channelVolumes[c];
+                    float absV = fabsf(fVal) * (1.0f / 32768.0f);
+                    if (absV > maxPeak) maxPeak = absV;
+                    if (absV > chPeaks[c]) chPeaks[c] = absV;
 
-            ConvertToFloat(data, format, fData, frames);
+                    if (fVal > 32767.0f) fVal = 32767.0f;
+                    else if (fVal < -32768.0f) fVal = -32768.0f;
+                    p16[base + c] = static_cast<int16_t>(fVal >= 0.0f ? (fVal + 0.5f) : (fVal - 0.5f));
+                }
+            }
+        }
+    }
+    else
+    {
+        UINT32 samples = frames * channels;
+        if (samples > m_applyTemp.size()) m_applyTemp.resize(samples);
+        float* fData = m_applyTemp.data();
 
+        ConvertToFloat(data, format, fData, frames);
+
+        if (allOne)
+        {
+            for (UINT32 i = 0; i < frames; ++i)
+            {
+                UINT32 base = i * channels;
+                for (UINT32 c = 0; c < channels; ++c)
+                {
+                    float val = fData[base + c];
+                    float absV = fabsf(val);
+                    if (absV > maxPeak) maxPeak = absV;
+                    if (absV > chPeaks[c]) chPeaks[c] = absV;
+                }
+            }
+        }
+        else
+        {
             for (UINT32 i = 0; i < frames; ++i)
             {
                 UINT32 base = i * channels;
@@ -2467,7 +2508,6 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
                     if (absV > chPeaks[c]) chPeaks[c] = absV;
                 }
             }
-
             ConvertFromFloat(fData, format, data, frames);
         }
     }
