@@ -43,7 +43,6 @@ static bool IsBlacklistApp()
 
     return (wcscmp(pName, L"consolcu.exe") == 0) ||
         (wcscmp(pName, L"ctaudcs.exe") == 0) ||
-        (wcscmp(pName, L"mypal.exe") == 0) ||
         (wcscmp(pName, L"spkconsl.exe") == 0);
 }
 
@@ -1488,28 +1487,37 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
             primary->Release();
         }
 
-        DWORD dwFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 |
-            DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_CTRLVOLUME |
-            DSBCAPS_CTRLFREQUENCY;
+        // Base DSCAPS flags
+        DWORD baseFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 |
+            DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLFREQUENCY;
+
+        // block DSBCAPS_CTRLPAN for more channels than Stereo
+        if (dsFormat.nChannels <= 2) {
+            baseFlags |= DSBCAPS_CTRLPAN;
+        }
 
         IDirectSoundBuffer* temp = NULL;
 
-        DSBUFFERDESC dsbd = { sizeof(DSBUFFERDESC), dwFlags | DSBCAPS_LOCHARDWARE, bufferBytes, 0, NULL, {0} };
+        // Trying to use hardware buffer
+        DSBUFFERDESC dsbd = { sizeof(DSBUFFERDESC), baseFlags | DSBCAPS_LOCHARDWARE | DSBCAPS_TRUEPLAYPOSITION, bufferBytes, 0, NULL, {0} };
         dsbd.lpwfxFormat = &dsFormat;
         hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
 
+        // Trying to use LOCDEFER (is it necessary?)
         if (FAILED(hr))
         {
-            dsbd.dwFlags = dwFlags | DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLFX;
+            dsbd.dwFlags = baseFlags | DSBCAPS_LOCDEFER;
             hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
         }
 
+        // Fallback to software buffer
         if (FAILED(hr))
         {
-            dsbd.dwFlags = dwFlags | DSBCAPS_LOCSOFTWARE;
+            dsbd.dwFlags = baseFlags | DSBCAPS_LOCSOFTWARE;
             hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
         }
 
+        // Fallback to Extensible format
         if (FAILED(hr) && isExtensible)
         {
             dsbd.lpwfxFormat = const_cast<WAVEFORMATEX*>(pFormat);
@@ -1673,8 +1681,7 @@ HRESULT __stdcall MyAudioClient::GetCurrentPadding(UINT32* pNumPaddingFrames)
     return S_OK;
 }
 
-HRESULT MyAudioClient::UpdatePositions(UINT32* padding)
-{
+HRESULT MyAudioClient::UpdatePositions(UINT32* padding) {
     if (padding == NULL) return E_POINTER;
 
     if (rate == 0)
@@ -2252,6 +2259,31 @@ void MyAudioClient::UpdateVolume() {
     }
 
     dsBuffer->SetVolume(dsVol);
+
+    // Using DSBCAPS_CTRLPAN for Stereo
+    if (channelVolumes.size() == 2) {
+        float left = channelVolumes[0];
+        float right = channelVolumes[1];
+        LONG dsPan = 0;
+
+        if (left > 0.00001f || right > 0.00001f) {
+            if (left > right) {
+                float ratio = right / left;
+                if (ratio < 0.00001f) ratio = 0.00001f;
+                dsPan = static_cast<LONG>(2000.0f * std::log10(ratio));
+            }
+            else if (right > left) {
+                float ratio = left / right;
+                if (ratio < 0.00001f) ratio = 0.00001f;
+                dsPan = static_cast<LONG>(-2000.0f * std::log10(ratio));
+            }
+        }
+
+        if (dsPan > 10000) dsPan = 10000;
+        if (dsPan < -10000) dsPan = -10000;
+
+        dsBuffer->SetPan(dsPan);
+    }
 }
 
 HRESULT MyAudioClient::GetPosition(UINT64* pu64Position, UINT64* pu64QPCPosition)
