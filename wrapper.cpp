@@ -1499,7 +1499,7 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         IDirectSoundBuffer* temp = NULL;
 
         // Trying to use hardware buffer
-        DSBUFFERDESC dsbd = { sizeof(DSBUFFERDESC), baseFlags | DSBCAPS_LOCHARDWARE | DSBCAPS_TRUEPLAYPOSITION, bufferBytes, 0, NULL, {0} };
+        DSBUFFERDESC dsbd = { sizeof(DSBUFFERDESC), baseFlags | DSBCAPS_LOCHARDWARE, bufferBytes, 0, NULL, {0} };
         dsbd.lpwfxFormat = &dsFormat;
         hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
 
