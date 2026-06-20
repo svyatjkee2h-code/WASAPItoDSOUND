@@ -1800,25 +1800,32 @@ HRESULT __stdcall MyAudioClient::IsFormatSupported(AUDCLNT_SHAREMODE ShareMode, 
     return S_OK;
 }
 
-HRESULT __stdcall MyAudioClient::GetMixFormat(WAVEFORMATEX** ppDeviceFormat) {
+HRESULT MyAudioClient::GetMixFormat(WAVEFORMATEX** ppDeviceFormat) {
     if (ppDeviceFormat == NULL) return E_POINTER;
 
-    WAVEFORMATEXTENSIBLE* wfex = static_cast<WAVEFORMATEXTENSIBLE*>(CoTaskMemAlloc(sizeof(WAVEFORMATEXTENSIBLE)));
+    WORD nChannels = 2;
+    DWORD nSamplesPerSec = 48000;
+    WORD wBitsPerSample = 16;
+
+    size_t cbSize = sizeof(WAVEFORMATEXTENSIBLE);
+    WAVEFORMATEXTENSIBLE* wfex = static_cast<WAVEFORMATEXTENSIBLE*>(CoTaskMemAlloc(cbSize));
     if (!wfex) return E_OUTOFMEMORY;
 
-    wfex->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-    wfex->Format.cbSize = 22;
-    wfex->Format.nChannels = 2;
-    wfex->Format.nSamplesPerSec = 48000;
-    wfex->Format.wBitsPerSample = 16;
-    wfex->Format.nBlockAlign = (2 * 16) / 8;
-    wfex->Format.nAvgBytesPerSec = 48000 * 4;
+    ZeroMemory(wfex, cbSize);
 
-    wfex->Samples.wValidBitsPerSample = 16;
-    wfex->dwChannelMask = 3;
+    wfex->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    wfex->Format.nChannels = nChannels;
+    wfex->Format.nSamplesPerSec = nSamplesPerSec;
+    wfex->Format.wBitsPerSample = wBitsPerSample;
+    wfex->Format.nBlockAlign = (nChannels * wBitsPerSample) / 8;
+    wfex->Format.nAvgBytesPerSec = nSamplesPerSec * wfex->Format.nBlockAlign;
+    wfex->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+    wfex->Samples.wValidBitsPerSample = wBitsPerSample;
+    wfex->dwChannelMask = (nChannels == 2) ? 0x3 : 0x0;
     wfex->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
 
     *ppDeviceFormat = reinterpret_cast<WAVEFORMATEX*>(wfex);
+
     return S_OK;
 }
 
@@ -2211,12 +2218,12 @@ HRESULT __stdcall MyAudioClient::GetCurrentSharedModeEnginePeriod(WAVEFORMATEX**
         wfex->Format.cbSize = 22;
         wfex->Format.nChannels = 2;
         wfex->Format.nSamplesPerSec = 48000;
-        wfex->Format.wBitsPerSample = 32;
-        wfex->Format.nBlockAlign = 8;
-        wfex->Format.nAvgBytesPerSec = 384000;
-        wfex->Samples.wValidBitsPerSample = 32;
+        wfex->Format.wBitsPerSample = 16;
+        wfex->Format.nBlockAlign = 4;
+        wfex->Format.nAvgBytesPerSec = 192000;
+        wfex->Samples.wValidBitsPerSample = 16;
         wfex->dwChannelMask = 3;
-        wfex->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+        wfex->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
         *pCurrentPeriodInFrames = 480;
     }
     else {
@@ -2901,12 +2908,12 @@ MyPropertyStore::MyPropertyStore(const wstring& n, EDataFlow f, const wstring& g
     mixFormat.Format.cbSize = 22;
     mixFormat.Format.nChannels = 2;
     mixFormat.Format.nSamplesPerSec = 48000;
-    mixFormat.Format.wBitsPerSample = 32;
-    mixFormat.Format.nBlockAlign = 8;
-    mixFormat.Format.nAvgBytesPerSec = 384000;
-    mixFormat.Samples.wValidBitsPerSample = 32;
+    mixFormat.Format.wBitsPerSample = 16;
+    mixFormat.Format.nBlockAlign = 4;
+    mixFormat.Format.nAvgBytesPerSec = 192000;
+    mixFormat.Samples.wValidBitsPerSample = 16;
     mixFormat.dwChannelMask = 3;
-    mixFormat.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    mixFormat.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
 }
 
 MyPropertyStore::~MyPropertyStore() {
