@@ -18,10 +18,6 @@ MyDeviceEnumerator* g_enumerator = nullptr;
 bool g_blacklisted = false;
 bool g_hasSSE2 = false;
 
-inline bool IsEqualPKey(const PROPERTYKEY& a, const PROPERTYKEY& b) {
-    return (a.pid == b.pid && IsEqualGUID(a.fmtid, b.fmtid));
-}
-
 static void InitSIMD()
 {
     int cpuInfo[4] = { 0 };
@@ -166,7 +162,7 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
     if (srcChannels == destChannels) {
         const UINT32 channels = srcChannels;
 
-	// SSE2 for stereo
+	//SSE2 for stereo
         if (channels == 2 && g_hasSSE2) {
             const __m128 one = _mm_set1_ps(1.0f);
             UINT32 i = 0;
@@ -211,7 +207,7 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
             return;
         }
 
-        // SSE2 for channels >= 4
+        //SSE2 for channels >= 4
         if (g_hasSSE2) {
             const __m128 one = _mm_set1_ps(1.0f);
             UINT32 i = 0;
@@ -286,7 +282,7 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
         return;
     }
 
-    // Mono to Stereo
+    //Mono to Stereo
     if (srcChannels == 1 && destChannels == 2) {
         for (UINT32 i = 0; i < destFrames; ++i) {
             UINT32 ipos = static_cast<UINT32>(pos);
@@ -309,7 +305,7 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
         return;
     }
 
-    // Stereo to Mono
+    //Stereo to Mono
     if (srcChannels == 2 && destChannels == 1) {
         if (g_hasSSE2) {
             const __m128 half = _mm_set1_ps(0.5f);
@@ -356,7 +352,7 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
         return;
     }
 
-    // null all other channels
+    //null all other channels
     memset(dest, 0, destFrames * destChannels * sizeof(float));
 }
 
@@ -1341,15 +1337,12 @@ HRESULT MyAudioClient::FillSilence() {
     if (flow != eRender || !dsBuffer) return S_OK;
     void* pData = NULL;
     DWORD dataLen = 0;
-
     HRESULT hr = dsBuffer->Lock(0, 0, &pData, &dataLen, NULL, NULL, DSBLOCK_ENTIREBUFFER);
     if (FAILED(hr)) {
         return hr;
     }
-
     BYTE silence = (format.Format.wBitsPerSample == 8) ? 128 : 0;
-    memset(pData, silence, dataLen);
-
+    memset(pData, (format.SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) ? 0 : silence, dataLen);
     dsBuffer->Unlock(pData, dataLen, NULL, 0);
     return S_OK;
 }
@@ -1359,21 +1352,25 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     if (pFormat == NULL) return E_POINTER;
     if (ShareMode != AUDCLNT_SHAREMODE_SHARED && ShareMode != AUDCLNT_SHAREMODE_EXCLUSIVE) return E_INVALIDARG;
 
-    // Hardblock FLOAT
-    if (pFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
-        (pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE && ((WAVEFORMATEXTENSIBLE*)pFormat)->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) {
-        return AUDCLNT_E_UNSUPPORTED_FORMAT;
-    }
+    DWORD ignored_flags =
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+        AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY |
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTSRC;
 
-    DWORD ignored_flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY | AUDCLNT_STREAMFLAGS_AUTOCONVERTSRC;
     StreamFlags &= ~ignored_flags;
 
-    DWORD valid_flags = AUDCLNT_STREAMFLAGS_CROSSPROCESS | AUDCLNT_STREAMFLAGS_LOOPBACK |
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST |
-        AUDCLNT_STREAMFLAGS_RATEADJUST | AUDCLNT_SESSIONFLAGS_EXPIREWHENUNOWNED |
-        AUDCLNT_SESSIONFLAGS_DISPLAY_HIDE | AUDCLNT_SESSIONFLAGS_DISPLAY_HIDEWHENEXPIRED;
+    DWORD valid_flags =
+        AUDCLNT_STREAMFLAGS_CROSSPROCESS |
+        AUDCLNT_STREAMFLAGS_LOOPBACK |
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+        AUDCLNT_STREAMFLAGS_NOPERSIST |
+        AUDCLNT_STREAMFLAGS_RATEADJUST |
+        AUDCLNT_SESSIONFLAGS_EXPIREWHENUNOWNED |
+        AUDCLNT_SESSIONFLAGS_DISPLAY_HIDE |
+        AUDCLNT_SESSIONFLAGS_DISPLAY_HIDEWHENEXPIRED;
 
-    if (StreamFlags & ~valid_flags) return E_INVALIDARG;
+    if (StreamFlags & ~valid_flags)
+        return E_INVALIDARG;
 
     if (pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
         format = *(WAVEFORMATEXTENSIBLE*)pFormat;
@@ -1383,7 +1380,6 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         format.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
         format.Samples.wValidBitsPerSample = pFormat->wBitsPerSample;
     }
-
     rate = pFormat->nSamplesPerSec;
     blockAlign = pFormat->nBlockAlign;
     channelVolumes.resize(format.Format.nChannels, 1.0f);
@@ -1395,15 +1391,21 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         if (ShareMode != AUDCLNT_SHAREMODE_SHARED) return AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
         isLoopback = true;
         flow = eCapture;
-        deviceGuid = GUID_NULL;
+        GUID nullGuid = { 0 };
+        deviceGuid = nullGuid;
     }
 
     if (ShareMode == AUDCLNT_SHAREMODE_SHARED) {
         const REFERENCE_TIME MIN_PERIODICITY = 300000;
-        if (hnsPeriodicity > 0 && hnsPeriodicity < MIN_PERIODICITY) hnsPeriodicity = MIN_PERIODICITY;
+        if (hnsPeriodicity > 0 && hnsPeriodicity < MIN_PERIODICITY) {
+            hnsPeriodicity = MIN_PERIODICITY;
+        }
+
         const REFERENCE_TIME MIN_BUFFER_DURATION = 1000000;
         if (hnsBufferDuration == 0) hnsBufferDuration = 1000000;
-        if (hnsBufferDuration < MIN_BUFFER_DURATION) hnsBufferDuration = MIN_BUFFER_DURATION;
+        if (hnsBufferDuration < MIN_BUFFER_DURATION) {
+            hnsBufferDuration = MIN_BUFFER_DURATION;
+        }
     }
 
     if (ShareMode == AUDCLNT_SHAREMODE_EXCLUSIVE) {
@@ -1448,10 +1450,12 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     bufferBytes = dsBufferFrames * blockAlign;
     m_applyTemp.resize(dsBufferFrames * format.Format.nChannels);
 
-    // Force PCM
     WAVEFORMATEX dsFormat = *pFormat;
-    if (pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-        dsFormat.wFormatTag = WAVE_FORMAT_PCM;
+    bool isExtensible = (pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE);
+    if (isExtensible) {
+        WAVEFORMATEXTENSIBLE* ex = (WAVEFORMATEXTENSIBLE*)pFormat;
+        if (ex->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) dsFormat.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        else if (ex->SubFormat == KSDATAFORMAT_SUBTYPE_PCM) dsFormat.wFormatTag = WAVE_FORMAT_PCM;
         dsFormat.cbSize = 0;
     }
 
@@ -1464,41 +1468,59 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         DWORD coopLevel = (ShareMode == AUDCLNT_SHAREMODE_SHARED) ? DSSCL_PRIORITY : DSSCL_EXCLUSIVE;
         hr = ds->SetCooperativeLevel(GetDesktopWindow(), coopLevel);
         if (FAILED(hr)) return hr;
-
-        // Creating primary buffer
         IDirectSoundBuffer* primary = NULL;
         DSBUFFERDESC pdsbd = { sizeof(DSBUFFERDESC), DSBCAPS_PRIMARYBUFFER | DSBCAPS_LOCHARDWARE, 0, 0, NULL, {0} };
 
-        if (SUCCEEDED(ds->CreateSoundBuffer(&pdsbd, &primary, NULL))) {
-            primary->SetFormat(&dsFormat);
+        if (SUCCEEDED(ds->CreateSoundBuffer(&pdsbd, &primary, NULL)))
+        {
+            HRESULT hrPrimFormat = primary->SetFormat(&dsFormat);
+
+            if (FAILED(hrPrimFormat) && dsFormat.wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
+            {
+                WAVEFORMATEX pcmFormat = dsFormat;
+                pcmFormat.wFormatTag = WAVE_FORMAT_PCM;
+                pcmFormat.wBitsPerSample = 16;
+                pcmFormat.nBlockAlign = (pcmFormat.nChannels * pcmFormat.wBitsPerSample) / 8;
+                pcmFormat.nAvgBytesPerSec = pcmFormat.nSamplesPerSec * pcmFormat.nBlockAlign;
+                primary->SetFormat(&pcmFormat);
+            }
             primary->Release();
         }
-        else {
-            // Fallback
-            pdsbd.dwFlags = DSBCAPS_PRIMARYBUFFER | DSBCAPS_LOCDEFER;
-            if (SUCCEEDED(ds->CreateSoundBuffer(&pdsbd, &primary, NULL))) {
-                primary->SetFormat(&dsFormat);
-                primary->Release();
-            }
-        }
 
+        // Base DSCAPS flags
         DWORD baseFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 |
             DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLFREQUENCY;
 
+        // block DSBCAPS_CTRLPAN for more channels than Stereo
         if (dsFormat.nChannels <= 2) {
             baseFlags |= DSBCAPS_CTRLPAN;
         }
 
         IDirectSoundBuffer* temp = NULL;
 
-        // Trying Secondary buffer
+        // Trying to use hardware buffer
         DSBUFFERDESC dsbd = { sizeof(DSBUFFERDESC), baseFlags | DSBCAPS_LOCHARDWARE, bufferBytes, 0, NULL, {0} };
         dsbd.lpwfxFormat = &dsFormat;
         hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
 
-        // Fallback
-        if (FAILED(hr)) {
+        // Trying to use LOCDEFER (is it necessary?)
+        if (FAILED(hr))
+        {
             dsbd.dwFlags = baseFlags | DSBCAPS_LOCDEFER;
+            hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
+        }
+
+        // Fallback to software buffer
+        if (FAILED(hr))
+        {
+            dsbd.dwFlags = baseFlags | DSBCAPS_LOCSOFTWARE;
+            hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
+        }
+
+        // Fallback to Extensible format
+        if (FAILED(hr) && isExtensible)
+        {
+            dsbd.lpwfxFormat = const_cast<WAVEFORMATEX*>(pFormat);
             hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
         }
 
@@ -1507,11 +1529,10 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         hr = temp->QueryInterface(IID_IDirectSoundBuffer8, (void**)&dsBuffer);
         temp->Release();
         if (FAILED(hr)) return hr;
-
         hr = dsBuffer->QueryInterface(IID_IDirectSoundNotify, (void**)&dsNotify);
         if (FAILED(hr)) dsNotify = NULL;
-
         FillSilence();
+
         silenceOffsetFrames = bufferFrames / 4;
     }
     else if (flow == eCapture && !isLoopback) {
@@ -1522,12 +1543,14 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         DSCBUFFERDESC dscbd = { sizeof(DSCBUFFERDESC), 0, bufferBytes, 0, NULL, 0, NULL };
         dscbd.lpwfxFormat = &dsFormat;
         hr = dsc->CreateCaptureBuffer(&dscbd, &temp, NULL);
+        if (FAILED(hr) && isExtensible) {
+            dscbd.lpwfxFormat = const_cast<WAVEFORMATEX*>(pFormat);
+            hr = dsc->CreateCaptureBuffer(&dscbd, &temp, NULL);
+        }
         if (FAILED(hr)) return hr;
-
         hr = temp->QueryInterface(IID_IDirectSoundCaptureBuffer8, (void**)&dscBuffer);
         temp->Release();
         if (FAILED(hr)) return hr;
-
         hr = dscBuffer->QueryInterface(IID_IDirectSoundNotify, (void**)&dsNotify);
         if (FAILED(hr)) dsNotify = NULL;
     }
@@ -1556,7 +1579,9 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     positionsInitialized = false;
     this->shareMode = ShareMode;
 
-    sessionGuid = AudioSessionGuid ? *AudioSessionGuid : GUID_NULL;
+    if (AudioSessionGuid) sessionGuid = *AudioSessionGuid;
+    else sessionGuid = GUID_NULL;
+
     session = g_enumerator->GetSession(sessionGuid, true);
     session->AddRef();
     session->clients.push_back(this);
@@ -1775,57 +1800,26 @@ HRESULT __stdcall MyAudioClient::IsFormatSupported(AUDCLNT_SHAREMODE ShareMode, 
     if (pFormat == NULL) return E_POINTER;
     if (ppClosestMatch) *ppClosestMatch = NULL;
     if (ShareMode != AUDCLNT_SHAREMODE_SHARED && ShareMode != AUDCLNT_SHAREMODE_EXCLUSIVE) return E_INVALIDARG;
-
-    // DSound limitations protection
     if (pFormat->nSamplesPerSec > 200000) return AUDCLNT_E_UNSUPPORTED_FORMAT;
-
-    // Hardblock FLOAT
-    if (pFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
-        return AUDCLNT_E_UNSUPPORTED_FORMAT;
-    }
-
-    // Blocking FLOAT inside function
-    if (pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-        const WAVEFORMATEXTENSIBLE* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pFormat);
-        if (ext->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) {
-            return AUDCLNT_E_UNSUPPORTED_FORMAT;
-        }
-    }
-
-    // Allow only PCM
-    if (pFormat->wFormatTag != WAVE_FORMAT_PCM && pFormat->wFormatTag != WAVE_FORMAT_EXTENSIBLE) {
-        return AUDCLNT_E_UNSUPPORTED_FORMAT;
-    }
-
+    if (pFormat->wFormatTag != WAVE_FORMAT_PCM && pFormat->wFormatTag != WAVE_FORMAT_IEEE_FLOAT && pFormat->wFormatTag != WAVE_FORMAT_EXTENSIBLE) return AUDCLNT_E_UNSUPPORTED_FORMAT;
     return S_OK;
 }
 
-HRESULT MyAudioClient::GetMixFormat(WAVEFORMATEX** ppDeviceFormat) {
+HRESULT __stdcall MyAudioClient::GetMixFormat(WAVEFORMATEX** ppDeviceFormat) {
     if (ppDeviceFormat == NULL) return E_POINTER;
-
-    WORD nChannels = 2;
-    DWORD nSamplesPerSec = 48000;
-    WORD wBitsPerSample = 16;
-
-    size_t cbSize = sizeof(WAVEFORMATEXTENSIBLE);
-    WAVEFORMATEXTENSIBLE* wfex = static_cast<WAVEFORMATEXTENSIBLE*>(CoTaskMemAlloc(cbSize));
+    WAVEFORMATEXTENSIBLE* wfex = static_cast<WAVEFORMATEXTENSIBLE*>(CoTaskMemAlloc(sizeof(WAVEFORMATEXTENSIBLE)));
     if (!wfex) return E_OUTOFMEMORY;
-
-    ZeroMemory(wfex, cbSize);
-
     wfex->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-    wfex->Format.nChannels = nChannels;
-    wfex->Format.nSamplesPerSec = nSamplesPerSec;
-    wfex->Format.wBitsPerSample = wBitsPerSample;
-    wfex->Format.nBlockAlign = (nChannels * wBitsPerSample) / 8;
-    wfex->Format.nAvgBytesPerSec = nSamplesPerSec * wfex->Format.nBlockAlign;
-    wfex->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-    wfex->Samples.wValidBitsPerSample = wBitsPerSample;
-    wfex->dwChannelMask = (nChannels == 2) ? 0x3 : 0x0;
-    wfex->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
-
+    wfex->Format.cbSize = 22;
+    wfex->Format.nChannels = 2;
+    wfex->Format.nSamplesPerSec = 48000;
+    wfex->Format.wBitsPerSample = 32;
+    wfex->Format.nBlockAlign = 8;
+    wfex->Format.nAvgBytesPerSec = 384000;
+    wfex->Samples.wValidBitsPerSample = 32;
+    wfex->dwChannelMask = 3;
+    wfex->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
     *ppDeviceFormat = reinterpret_cast<WAVEFORMATEX*>(wfex);
-
     return S_OK;
 }
 
@@ -2218,12 +2212,12 @@ HRESULT __stdcall MyAudioClient::GetCurrentSharedModeEnginePeriod(WAVEFORMATEX**
         wfex->Format.cbSize = 22;
         wfex->Format.nChannels = 2;
         wfex->Format.nSamplesPerSec = 48000;
-        wfex->Format.wBitsPerSample = 16;
-        wfex->Format.nBlockAlign = 4;
-        wfex->Format.nAvgBytesPerSec = 192000;
-        wfex->Samples.wValidBitsPerSample = 16;
+        wfex->Format.wBitsPerSample = 32;
+        wfex->Format.nBlockAlign = 8;
+        wfex->Format.nAvgBytesPerSec = 384000;
+        wfex->Samples.wValidBitsPerSample = 32;
         wfex->dwChannelMask = 3;
-        wfex->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+        wfex->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
         *pCurrentPeriodInFrames = 480;
     }
     else {
@@ -2380,27 +2374,165 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
 
     float maxPeak = 0.0f;
     std::vector<float> chPeaks(channels, 0.0f);
+    bool isFloat = IsFloatFormat(format);
     UINT32 bits = format.Format.wBitsPerSample;
 
-    if (bits == 16)
+    if (isFloat)
+    {
+        float* fData = reinterpret_cast<float*>(data);
+
+        if (allOne)
+        {
+            if (g_hasSSE2 && channels == 2)
+            {
+                __m128 max_v = _mm_setzero_ps();
+                __m128 sign_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+                UINT32 i = 0;
+                for (; i + 4 <= frames; i += 4)
+                {
+                    __m128 v0 = _mm_loadu_ps(fData + i * 2);
+                    __m128 v1 = _mm_loadu_ps(fData + i * 2 + 4);
+                    __m128 abs_v0 = _mm_and_ps(v0, sign_mask);
+                    __m128 abs_v1 = _mm_and_ps(v1, sign_mask);
+                    max_v = _mm_max_ps(max_v, abs_v0);
+                    max_v = _mm_max_ps(max_v, abs_v1);
+                }
+
+                float peaks[4];
+                _mm_storeu_ps(peaks, max_v);
+                float peakL = std::max(peaks[0], peaks[2]);
+                float peakR = std::max(peaks[1], peaks[3]);
+                chPeaks[0] = std::max(chPeaks[0], peakL);
+                chPeaks[1] = std::max(chPeaks[1], peakR);
+                maxPeak = std::max({ maxPeak, peakL, peakR });
+                for (; i < frames; ++i)
+                {
+                    float absL = fabsf(fData[i * 2]);
+                    float absR = fabsf(fData[i * 2 + 1]);
+                    if (absL > chPeaks[0]) chPeaks[0] = absL;
+                    if (absR > chPeaks[1]) chPeaks[1] = absR;
+                    if (absL > maxPeak) maxPeak = absL;
+                    if (absR > maxPeak) maxPeak = absR;
+                }
+            }
+            else
+            {
+                for (UINT32 i = 0; i < frames; ++i)
+                {
+                    UINT32 base = i * channels;
+                    for (UINT32 c = 0; c < channels; ++c)
+                    {
+                        float val = fData[base + c];
+                        float absV = fabsf(val);
+                        if (absV > maxPeak) maxPeak = absV;
+                        if (absV > chPeaks[c]) chPeaks[c] = absV;
+                    }
+                }
+            }
+        }
+        else
+        {
+            if (g_hasSSE2 && channels == 2)
+            {
+                float vL = channelVolumes[0];
+                float vR = channelVolumes[1];
+                __m128 vol = _mm_set_ps(vR, vL, vR, vL);
+
+                __m128 max_v = _mm_setzero_ps();
+                __m128 sign_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+                UINT32 i = 0;
+                for (; i + 4 <= frames; i += 4)
+                {
+                    __m128 v0 = _mm_loadu_ps(fData + i * 2);
+                    __m128 v1 = _mm_loadu_ps(fData + i * 2 + 4);
+
+                    __m128 res0 = _mm_mul_ps(v0, vol);
+                    __m128 res1 = _mm_mul_ps(v1, vol);
+
+                    _mm_storeu_ps(fData + i * 2, res0);
+                    _mm_storeu_ps(fData + i * 2 + 4, res1);
+
+                    __m128 abs_v0 = _mm_and_ps(res0, sign_mask);
+                    __m128 abs_v1 = _mm_and_ps(res1, sign_mask);
+
+                    max_v = _mm_max_ps(max_v, abs_v0);
+                    max_v = _mm_max_ps(max_v, abs_v1);
+                }
+
+                float peaks[4];
+                _mm_storeu_ps(peaks, max_v);
+                float peakL = std::max(peaks[0], peaks[2]);
+                float peakR = std::max(peaks[1], peaks[3]);
+
+                chPeaks[0] = std::max(chPeaks[0], peakL);
+                chPeaks[1] = std::max(chPeaks[1], peakR);
+                maxPeak = std::max({ maxPeak, peakL, peakR });
+
+                for (; i < frames; ++i)
+                {
+                    UINT32 base = i * 2;
+                    fData[base] *= vL;
+                    fData[base + 1] *= vR;
+
+                    float absL = fabsf(fData[base]);
+                    float absR = fabsf(fData[base + 1]);
+
+                    if (absL > chPeaks[0]) chPeaks[0] = absL;
+                    if (absR > chPeaks[1]) chPeaks[1] = absR;
+                    if (absL > maxPeak) maxPeak = absL;
+                    if (absR > maxPeak) maxPeak = absR;
+                }
+            }
+            else
+            {
+                for (UINT32 i = 0; i < frames; ++i)
+                {
+                    UINT32 base = i * channels;
+                    for (UINT32 c = 0; c < channels; ++c)
+                    {
+                        float val = fData[base + c] * channelVolumes[c];
+                        fData[base + c] = val;
+                        float absV = fabsf(val);
+                        if (absV > maxPeak) maxPeak = absV;
+                        if (absV > chPeaks[c]) chPeaks[c] = absV;
+                    }
+                }
+            }
+        }
+    }
+    else if (bits == 16)
     {
         int16_t* p16 = reinterpret_cast<int16_t*>(data);
-
-        for (UINT32 i = 0; i < frames; ++i)
+        if (allOne)
         {
-            UINT32 base = i * channels;
-            for (UINT32 c = 0; c < channels; ++c)
+            for (UINT32 i = 0; i < frames; ++i)
             {
-                float fVal = static_cast<float>(p16[base + c]);
-                if (!allOne) fVal *= channelVolumes[c];
-                if (fVal > 32767.0f) fVal = 32767.0f;
-                else if (fVal < -32768.0f) fVal = -32768.0f;
+                UINT32 base = i * channels;
+                for (UINT32 c = 0; c < channels; ++c)
+                {
+                    int val = p16[base + c];
+                    float absV = std::abs(val) * (1.0f / 32768.0f);
+                    if (absV > maxPeak) maxPeak = absV;
+                    if (absV > chPeaks[c]) chPeaks[c] = absV;
+                }
+            }
+        }
+        else
+        {
+            for (UINT32 i = 0; i < frames; ++i)
+            {
+                UINT32 base = i * channels;
+                for (UINT32 c = 0; c < channels; ++c)
+                {
+                    float fVal = static_cast<float>(p16[base + c]) * channelVolumes[c];
+                    float absV = fabsf(fVal) * (1.0f / 32768.0f);
+                    if (absV > maxPeak) maxPeak = absV;
+                    if (absV > chPeaks[c]) chPeaks[c] = absV;
 
-                p16[base + c] = static_cast<int16_t>(fVal >= 0.0f ? (fVal + 0.5f) : (fVal - 0.5f));
-
-                float absV = fabsf(fVal) * (1.0f / 32768.0f);
-                if (absV > maxPeak) maxPeak = absV;
-                if (absV > chPeaks[c]) chPeaks[c] = absV;
+                    if (fVal > 32767.0f) fVal = 32767.0f;
+                    else if (fVal < -32768.0f) fVal = -32768.0f;
+                    p16[base + c] = static_cast<int16_t>(fVal >= 0.0f ? (fVal + 0.5f) : (fVal - 0.5f));
+                }
             }
         }
     }
@@ -2412,23 +2544,36 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
 
         ConvertToFloat(data, format, fData, frames);
 
-        for (UINT32 i = 0; i < frames; ++i)
+        if (allOne)
         {
-            UINT32 base = i * channels;
-            for (UINT32 c = 0; c < channels; ++c)
+            for (UINT32 i = 0; i < frames; ++i)
             {
-                float val = fData[base + c];
-                if (!allOne) val *= channelVolumes[c];
-
-                val = std::max(-1.0f, std::min(1.0f, val));
-                fData[base + c] = val;
-
-                float absV = fabsf(val);
-                if (absV > maxPeak) maxPeak = absV;
-                if (absV > chPeaks[c]) chPeaks[c] = absV;
+                UINT32 base = i * channels;
+                for (UINT32 c = 0; c < channels; ++c)
+                {
+                    float val = fData[base + c];
+                    float absV = fabsf(val);
+                    if (absV > maxPeak) maxPeak = absV;
+                    if (absV > chPeaks[c]) chPeaks[c] = absV;
+                }
             }
         }
-        ConvertFromFloat(fData, format, data, frames);
+        else
+        {
+            for (UINT32 i = 0; i < frames; ++i)
+            {
+                UINT32 base = i * channels;
+                for (UINT32 c = 0; c < channels; ++c)
+                {
+                    float val = fData[base + c] * channelVolumes[c];
+                    fData[base + c] = val;
+                    float absV = fabsf(val);
+                    if (absV > maxPeak) maxPeak = absV;
+                    if (absV > chPeaks[c]) chPeaks[c] = absV;
+                }
+            }
+            ConvertFromFloat(fData, format, data, frames);
+        }
     }
 
     m_peakValue = maxPeak;
@@ -2908,12 +3053,12 @@ MyPropertyStore::MyPropertyStore(const wstring& n, EDataFlow f, const wstring& g
     mixFormat.Format.cbSize = 22;
     mixFormat.Format.nChannels = 2;
     mixFormat.Format.nSamplesPerSec = 48000;
-    mixFormat.Format.wBitsPerSample = 16;
-    mixFormat.Format.nBlockAlign = 4;
-    mixFormat.Format.nAvgBytesPerSec = 192000;
-    mixFormat.Samples.wValidBitsPerSample = 16;
+    mixFormat.Format.wBitsPerSample = 32;
+    mixFormat.Format.nBlockAlign = 8;
+    mixFormat.Format.nAvgBytesPerSec = 384000;
+    mixFormat.Samples.wValidBitsPerSample = 32;
     mixFormat.dwChannelMask = 3;
-    mixFormat.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+    mixFormat.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 }
 
 MyPropertyStore::~MyPropertyStore() {
@@ -2979,7 +3124,7 @@ HRESULT __stdcall MyPropertyStore::GetValue(const PROPERTYKEY& key, PROPVARIANT*
     if (pv == NULL) return E_POINTER;
     PropVariantInit(pv);
 
-    if (IsEqualPKey(key, PKEY_Device_FriendlyName))
+    if (key == PKEY_Device_FriendlyName)
     {
         pv->vt = VT_LPWSTR;
         pv->pwszVal = static_cast<LPWSTR>(CoTaskMemAlloc((deviceName.length() + 1) * sizeof(wchar_t)));
@@ -2987,7 +3132,7 @@ HRESULT __stdcall MyPropertyStore::GetValue(const PROPERTYKEY& key, PROPVARIANT*
         wcscpy_s(pv->pwszVal, deviceName.length() + 1, deviceName.c_str());
         return S_OK;
     }
-    else if (IsEqualPKey(key, PKEY_Device_DeviceDesc))
+    else if (key == PKEY_Device_DeviceDesc)
     {
         wstring desc = deviceName + L" Device";
         pv->vt = VT_LPWSTR;
@@ -2996,7 +3141,7 @@ HRESULT __stdcall MyPropertyStore::GetValue(const PROPERTYKEY& key, PROPVARIANT*
         wcscpy_s(pv->pwszVal, desc.length() + 1, desc.c_str());
         return S_OK;
     }
-    else if (IsEqualPKey(key, PKEY_DeviceInterface_FriendlyName))
+    else if (key == PKEY_DeviceInterface_FriendlyName)
     {
         wstring ifName = deviceName + L" Interface";
         pv->vt = VT_LPWSTR;
@@ -3005,27 +3150,22 @@ HRESULT __stdcall MyPropertyStore::GetValue(const PROPERTYKEY& key, PROPVARIANT*
         wcscpy_s(pv->pwszVal, ifName.length() + 1, ifName.c_str());
         return S_OK;
     }
-    else if (IsEqualPKey(key, PKEY_AudioEngine_DeviceFormat))
+    else if (key == PKEY_AudioEngine_DeviceFormat)
     {
-        WAVEFORMATEXTENSIBLE cleanFormat;
-        ZeroMemory(&cleanFormat, sizeof(WAVEFORMATEXTENSIBLE));
-        memcpy(&cleanFormat, &mixFormat, sizeof(WAVEFORMATEXTENSIBLE));
-
         pv->vt = VT_BLOB;
         pv->blob.cbSize = sizeof(WAVEFORMATEXTENSIBLE);
         pv->blob.pBlobData = static_cast<BYTE*>(CoTaskMemAlloc(sizeof(WAVEFORMATEXTENSIBLE)));
         if (!pv->blob.pBlobData) return E_OUTOFMEMORY;
-
-        memcpy(pv->blob.pBlobData, &cleanFormat, sizeof(WAVEFORMATEXTENSIBLE));
+        memcpy(pv->blob.pBlobData, &mixFormat, sizeof(WAVEFORMATEXTENSIBLE));
         return S_OK;
     }
-    else if (IsEqualPKey(key, PKEY_AudioEndpoint_FormFactor))
+    else if (key == PKEY_AudioEndpoint_FormFactor)
     {
         pv->vt = VT_UI4;
         pv->ulVal = (flow == eRender) ? Speakers : Microphone;
         return S_OK;
     }
-    else if (IsEqualPKey(key, PKEY_AudioEndpoint_GUID))
+    else if (key == PKEY_AudioEndpoint_GUID)
     {
         pv->vt = VT_LPWSTR;
         pv->pwszVal = static_cast<LPWSTR>(CoTaskMemAlloc((endpointGuid.length() + 1) * sizeof(wchar_t)));
@@ -3033,7 +3173,7 @@ HRESULT __stdcall MyPropertyStore::GetValue(const PROPERTYKEY& key, PROPVARIANT*
         wcscpy_s(pv->pwszVal, endpointGuid.length() + 1, endpointGuid.c_str());
         return S_OK;
     }
-    else if (IsEqualPKey(key, PKEY_DeviceClass_IconPath))
+    else if (key == PKEY_DeviceClass_IconPath)
     {
         pv->vt = VT_LPWSTR;
         wstring iconPath = (flow == eRender)
@@ -3044,7 +3184,7 @@ HRESULT __stdcall MyPropertyStore::GetValue(const PROPERTYKEY& key, PROPVARIANT*
         wcscpy_s(pv->pwszVal, iconPath.length() + 1, iconPath.c_str());
         return S_OK;
     }
-    else if (IsEqualPKey(key, PKEY_Device_InstanceId))
+    else if (key == PKEY_Device_InstanceId)
     {
         pv->vt = VT_LPWSTR;
         pv->pwszVal = static_cast<LPWSTR>(CoTaskMemAlloc((group.length() + 1) * sizeof(wchar_t)));
@@ -3052,7 +3192,7 @@ HRESULT __stdcall MyPropertyStore::GetValue(const PROPERTYKEY& key, PROPVARIANT*
         wcscpy_s(pv->pwszVal, group.length() + 1, group.c_str());
         return S_OK;
     }
-    else if (IsEqualPKey(key, PKEY_Device_Manufacturer))
+    else if (key == PKEY_Device_Manufacturer)
     {
         pv->vt = VT_LPWSTR;
         pv->pwszVal = static_cast<LPWSTR>(CoTaskMemAlloc((vendor.length() + 1) * sizeof(wchar_t)));
@@ -3060,7 +3200,7 @@ HRESULT __stdcall MyPropertyStore::GetValue(const PROPERTYKEY& key, PROPVARIANT*
         wcscpy_s(pv->pwszVal, vendor.length() + 1, vendor.c_str());
         return S_OK;
     }
-    else if (IsEqualPKey(key, PKEY_Device_EnumeratorName))
+    else if (key == PKEY_Device_EnumeratorName)
     {
         pv->vt = VT_LPWSTR;
         const wchar_t* en = L"DirectSound";
