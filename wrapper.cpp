@@ -164,7 +164,7 @@ static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames
     if (srcChannels == destChannels) {
         const UINT32 channels = srcChannels;
 
-	//SSE2 for stereo
+        //SSE2 for stereo
         if (channels == 2 && g_hasSSE2) {
             const __m128 one = _mm_set1_ps(1.0f);
             UINT32 i = 0;
@@ -1457,13 +1457,29 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     bufferBytes = dsBufferFrames * blockAlign;
     m_applyTemp.resize(dsBufferFrames * format.Format.nChannels);
 
-    WAVEFORMATEX dsFormat = *pFormat;
+    WAVEFORMATEXTENSIBLE dsFormatEx = {};
+    if (pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        dsFormatEx = *reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pFormat);
+    }
+    else {
+        dsFormatEx.Format = *pFormat;
+    }
+
     bool isExtensible = (pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE);
-    if (isExtensible) {
-        WAVEFORMATEXTENSIBLE* ex = (WAVEFORMATEXTENSIBLE*)pFormat;
-        if (ex->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) dsFormat.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
-        else if (ex->SubFormat == KSDATAFORMAT_SUBTYPE_PCM) dsFormat.wFormatTag = WAVE_FORMAT_PCM;
-        dsFormat.cbSize = 0;
+    bool needsFloatToPCM = (flow == eRender) && IsFloatFormat(format) && (format.Format.nChannels > 2);
+
+    if (needsFloatToPCM) {
+        if (isExtensible) {
+            dsFormatEx.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+        }
+        else {
+            dsFormatEx.Format.wFormatTag = WAVE_FORMAT_PCM;
+        }
+    }
+    else if (isExtensible && pFormat->nChannels <= 2) {
+        if (dsFormatEx.SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) dsFormatEx.Format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        else if (dsFormatEx.SubFormat == KSDATAFORMAT_SUBTYPE_PCM) dsFormatEx.Format.wFormatTag = WAVE_FORMAT_PCM;
+        dsFormatEx.Format.cbSize = 0;
     }
 
     HRESULT hr;
@@ -1480,11 +1496,11 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
 
         if (SUCCEEDED(ds->CreateSoundBuffer(&pdsbd, &primary, NULL)))
         {
-            HRESULT hrPrimFormat = primary->SetFormat(&dsFormat);
+            HRESULT hrPrimFormat = primary->SetFormat(&dsFormatEx.Format);
 
-            if (FAILED(hrPrimFormat) && dsFormat.wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
+            if (FAILED(hrPrimFormat) && dsFormatEx.Format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
             {
-                WAVEFORMATEX pcmFormat = dsFormat;
+                WAVEFORMATEX pcmFormat = dsFormatEx.Format;
                 pcmFormat.wFormatTag = WAVE_FORMAT_PCM;
                 pcmFormat.wBitsPerSample = 16;
                 pcmFormat.nBlockAlign = (pcmFormat.nChannels * pcmFormat.wBitsPerSample) / 8;
@@ -1499,7 +1515,7 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
 
         if (!IsFloatFormat(format)) {
             baseFlags |= DSBCAPS_CTRLVOLUME;
-            if (dsFormat.nChannels <= 2) {
+            if (dsFormatEx.Format.nChannels <= 2) {
                 baseFlags |= DSBCAPS_CTRLPAN;
             }
         }
@@ -1507,7 +1523,7 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
         IDirectSoundBuffer* temp = NULL;
 
         DSBUFFERDESC dsbd = { sizeof(DSBUFFERDESC), baseFlags | DSBCAPS_LOCHARDWARE, bufferBytes, 0, NULL, {0} };
-        dsbd.lpwfxFormat = &dsFormat;
+        dsbd.lpwfxFormat = &dsFormatEx.Format;
         hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
 
         if (FAILED(hr))
@@ -1539,7 +1555,7 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
 
         IDirectSoundCaptureBuffer* temp = NULL;
         DSCBUFFERDESC dscbd = { sizeof(DSCBUFFERDESC), 0, bufferBytes, 0, NULL, 0, NULL };
-        dscbd.lpwfxFormat = &dsFormat;
+        dscbd.lpwfxFormat = &dsFormatEx.Format;
         hr = dsc->CreateCaptureBuffer(&dscbd, &temp, NULL);
         if (FAILED(hr) && isExtensible) {
             dscbd.lpwfxFormat = const_cast<WAVEFORMATEX*>(pFormat);
@@ -2447,6 +2463,37 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
                     if (absR > maxPeak) maxPeak = absR;
                 }
             }
+            else if (g_hasSSE2 && channels >= 4)
+            {
+                UINT32 vecChannels = channels - (channels % 4);
+                __m128 max_v = _mm_setzero_ps();
+                __m128 sign_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+
+                for (UINT32 i = 0; i < frames; ++i) {
+                    UINT32 base = i * channels;
+                    UINT32 c = 0;
+                    for (UINT32 v = 0; v < vecChannels / 4; ++v, c += 4) {
+                        __m128 val = _mm_loadu_ps(fData + base + c);
+                        __m128 abs_v = _mm_and_ps(val, sign_mask);
+                        max_v = _mm_max_ps(max_v, abs_v);
+
+                        float temp[4];
+                        _mm_storeu_ps(temp, abs_v);
+                        if (temp[0] > chPeaks[c]) chPeaks[c] = temp[0];
+                        if (temp[1] > chPeaks[c + 1]) chPeaks[c + 1] = temp[1];
+                        if (temp[2] > chPeaks[c + 2]) chPeaks[c + 2] = temp[2];
+                        if (temp[3] > chPeaks[c + 3]) chPeaks[c + 3] = temp[3];
+                    }
+                    for (; c < channels; ++c) {
+                        float absV = fabsf(fData[base + c]);
+                        if (absV > maxPeak) maxPeak = absV;
+                        if (absV > chPeaks[c]) chPeaks[c] = absV;
+                    }
+                }
+                float peaks[4];
+                _mm_storeu_ps(peaks, max_v);
+                maxPeak = std::max({ maxPeak, peaks[0], peaks[1], peaks[2], peaks[3] });
+            }
             else
             {
                 for (UINT32 i = 0; i < frames; ++i)
@@ -2514,6 +2561,47 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
                     if (absL > maxPeak) maxPeak = absL;
                     if (absR > maxPeak) maxPeak = absR;
                 }
+            }
+            else if (g_hasSSE2 && channels >= 4)
+            {
+                UINT32 vecChannels = channels - (channels % 4);
+                std::vector<__m128> volVecs(vecChannels / 4);
+                for (UINT32 v = 0; v < vecChannels / 4; ++v) {
+                    volVecs[v] = _mm_loadu_ps(&combinedVols[v * 4]);
+                }
+
+                __m128 max_v = _mm_setzero_ps();
+                __m128 sign_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+
+                for (UINT32 i = 0; i < frames; ++i) {
+                    UINT32 base = i * channels;
+                    UINT32 c = 0;
+                    for (UINT32 v = 0; v < vecChannels / 4; ++v, c += 4) {
+                        __m128 val = _mm_loadu_ps(fData + base + c);
+                        __m128 res = _mm_mul_ps(val, volVecs[v]);
+                        _mm_storeu_ps(fData + base + c, res);
+
+                        __m128 abs_v = _mm_and_ps(res, sign_mask);
+                        max_v = _mm_max_ps(max_v, abs_v);
+
+                        float temp[4];
+                        _mm_storeu_ps(temp, abs_v);
+                        if (temp[0] > chPeaks[c]) chPeaks[c] = temp[0];
+                        if (temp[1] > chPeaks[c + 1]) chPeaks[c + 1] = temp[1];
+                        if (temp[2] > chPeaks[c + 2]) chPeaks[c + 2] = temp[2];
+                        if (temp[3] > chPeaks[c + 3]) chPeaks[c + 3] = temp[3];
+                    }
+                    for (; c < channels; ++c) {
+                        float val = fData[base + c] * combinedVols[c];
+                        fData[base + c] = val;
+                        float absV = fabsf(val);
+                        if (absV > maxPeak) maxPeak = absV;
+                        if (absV > chPeaks[c]) chPeaks[c] = absV;
+                    }
+                }
+                float peaks[4];
+                _mm_storeu_ps(peaks, max_v);
+                maxPeak = std::max({ maxPeak, peaks[0], peaks[1], peaks[2], peaks[3] });
             }
             else
             {
@@ -2742,7 +2830,7 @@ HRESULT __stdcall MyRenderClient::ReleaseBuffer(UINT32 NumFramesWritten, DWORD d
     if (isSilent)
     {
         BYTE silence = (parent->format.Format.wBitsPerSample == 8) ? 128 : 0;
-        bool isFloat = (parent->format.SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        bool isFloat = IsFloatFormat(parent->format);
         memset(dataPtr, isFloat ? 0 : silence, writtenFrames * parent->blockAlign);
     }
     else if (writtenFrames > 0)
@@ -2755,7 +2843,7 @@ HRESULT __stdcall MyRenderClient::ReleaseBuffer(UINT32 NumFramesWritten, DWORD d
         UINT32 remainFrames = fullFrames - writtenFrames;
         BYTE* remainPtr = dataPtr + (writtenFrames * parent->blockAlign);
         BYTE silence = (parent->format.Format.wBitsPerSample == 8) ? 128 : 0;
-        bool isFloat = (parent->format.SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        bool isFloat = IsFloatFormat(parent->format);
         memset(remainPtr, isFloat ? 0 : silence, remainFrames * parent->blockAlign);
     }
 
@@ -2763,6 +2851,43 @@ HRESULT __stdcall MyRenderClient::ReleaseBuffer(UINT32 NumFramesWritten, DWORD d
     {
         BYTE* feedData = usingTemp ? tempBuffer : static_cast<BYTE*>(parent->lockP1);
         g_enumerator->FeedLoopback(feedData, writtenFrames, parent->format);
+    }
+
+    if (writtenFrames > 0 && parent->flow == eRender && IsFloatFormat(parent->format) && parent->format.Format.nChannels > 2)
+    {
+        UINT32 samples = writtenFrames * parent->format.Format.nChannels;
+        float* fData = reinterpret_cast<float*>(dataPtr);
+        int32_t* iData = reinterpret_cast<int32_t*>(dataPtr);
+
+        if (g_hasSSE2)
+        {
+            const __m128 min_val = _mm_set1_ps(-1.0f);
+            const __m128 max_val = _mm_set1_ps(1.0f);
+            const __m128 scale_mul = _mm_set1_ps(2147483647.0f);
+
+            UINT32 i = 0;
+            for (; i + 4 <= samples; i += 4)
+            {
+                __m128 v = _mm_loadu_ps(fData + i);
+                v = _mm_max_ps(min_val, _mm_min_ps(max_val, v));
+                v = _mm_mul_ps(v, scale_mul);
+                __m128i iv = _mm_cvtps_epi32(v);
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(iData + i), iv);
+            }
+            for (; i < samples; ++i)
+            {
+                float v = std::max(std::min(fData[i], 1.0f), -1.0f);
+                iData[i] = static_cast<int32_t>(v * 2147483647.0f);
+            }
+        }
+        else
+        {
+            for (UINT32 i = 0; i < samples; ++i)
+            {
+                float v = std::max(std::min(fData[i], 1.0f), -1.0f);
+                iData[i] = static_cast<int32_t>(v * 2147483647.0f);
+            }
+        }
     }
 
     if (usingTemp)
