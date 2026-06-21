@@ -135,7 +135,9 @@ BOOL CALLBACK DSEnumCallback(LPGUID lpGuid, LPCWSTR lpcstrDescription, LPCWSTR l
 }
 
 static bool IsFloatFormat(const WAVEFORMATEXTENSIBLE& fmt) {
-    return (fmt.SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT && fmt.Format.wBitsPerSample == 32);
+    return (fmt.Format.wBitsPerSample == 32) &&
+        (fmt.Format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+            fmt.SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
 }
 
 static void ResampleFloat(const float* src, UINT32 srcChannels, UINT32 srcFrames,
@@ -1377,7 +1379,12 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     }
     else {
         format.Format = *pFormat;
-        format.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+        if (pFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+            format.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+        }
+        else {
+            format.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+        }
         format.Samples.wValidBitsPerSample = pFormat->wBitsPerSample;
     }
     rate = pFormat->nSamplesPerSec;
@@ -1487,37 +1494,28 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
             primary->Release();
         }
 
-        // Base DSCAPS flags
         DWORD baseFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2 |
-            DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLFREQUENCY;
+            DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_CTRLFREQUENCY;
 
-        // block DSBCAPS_CTRLPAN for more channels than Stereo
-        if (dsFormat.nChannels <= 2) {
-            baseFlags |= DSBCAPS_CTRLPAN;
+        if (!IsFloatFormat(format)) {
+            baseFlags |= DSBCAPS_CTRLVOLUME;
+            if (dsFormat.nChannels <= 2) {
+                baseFlags |= DSBCAPS_CTRLPAN;
+            }
         }
 
         IDirectSoundBuffer* temp = NULL;
 
-        // Trying to use hardware buffer
         DSBUFFERDESC dsbd = { sizeof(DSBUFFERDESC), baseFlags | DSBCAPS_LOCHARDWARE, bufferBytes, 0, NULL, {0} };
         dsbd.lpwfxFormat = &dsFormat;
         hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
 
-        // Trying to use LOCDEFER (is it necessary?)
         if (FAILED(hr))
         {
             dsbd.dwFlags = baseFlags | DSBCAPS_LOCDEFER;
             hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
         }
 
-        // Fallback to software buffer
-        if (FAILED(hr))
-        {
-            dsbd.dwFlags = baseFlags | DSBCAPS_LOCSOFTWARE;
-            hr = ds->CreateSoundBuffer(&dsbd, &temp, NULL);
-        }
-
-        // Fallback to Extensible format
         if (FAILED(hr) && isExtensible)
         {
             dsbd.lpwfxFormat = const_cast<WAVEFORMATEX*>(pFormat);
@@ -2247,6 +2245,12 @@ HRESULT __stdcall MyAudioClient::InitializeSharedAudioStream(DWORD StreamFlags, 
 void MyAudioClient::UpdateVolume() {
     if (flow != eRender || !dsBuffer || !g_enumerator || !session || isLoopback) return;
 
+    // Restrict DS volume control for FLOAT
+    if (IsFloatFormat(format)) {
+        return;
+    }
+
+    // DS volume control for PCM
     float effective = g_enumerator->masterVolume * session->volume;
     bool muted = g_enumerator->masterMute || session->mute;
 
@@ -2367,15 +2371,43 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
     UINT32 channels = format.Format.nChannels;
     if (channels != channelVolumes.size()) return;
 
+    bool isFloat = IsFloatFormat(format);
+    UINT32 bits = format.Format.wBitsPerSample;
+
+    std::vector<float> combinedVols(channels, 1.0f);
     bool allOne = true;
-    for (float v : channelVolumes) {
-        if (v != 1.0f) { allOne = false; break; }
+
+    if (isFloat)
+    {
+        float masterSessionVol = 1.0f;
+        if (g_enumerator && session) {
+            if (g_enumerator->masterMute || session->mute) {
+                masterSessionVol = 0.0f;
+            }
+            else {
+                masterSessionVol = g_enumerator->masterVolume * session->volume;
+            }
+        }
+
+        for (UINT32 c = 0; c < channels; ++c) {
+            combinedVols[c] = channelVolumes[c] * masterSessionVol;
+            if (combinedVols[c] != 1.0f) {
+                allOne = false;
+            }
+        }
+    }
+    else
+    {
+        for (UINT32 c = 0; c < channels; ++c) {
+            combinedVols[c] = channelVolumes[c];
+            if (combinedVols[c] != 1.0f) {
+                allOne = false;
+            }
+        }
     }
 
     float maxPeak = 0.0f;
     std::vector<float> chPeaks(channels, 0.0f);
-    bool isFloat = IsFloatFormat(format);
-    UINT32 bits = format.Format.wBitsPerSample;
 
     if (isFloat)
     {
@@ -2434,9 +2466,9 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
         {
             if (g_hasSSE2 && channels == 2)
             {
-                float vL = channelVolumes[0];
-                float vR = channelVolumes[1];
-                __m128 vol = _mm_set_ps(vR, vL, vR, vL);
+                float vL = combinedVols[0];
+                float vR = combinedVols[1];
+                __m128 vol = _mm_setr_ps(vL, vR, vL, vR);
 
                 __m128 max_v = _mm_setzero_ps();
                 __m128 sign_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
@@ -2490,7 +2522,7 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
                     UINT32 base = i * channels;
                     for (UINT32 c = 0; c < channels; ++c)
                     {
-                        float val = fData[base + c] * channelVolumes[c];
+                        float val = fData[base + c] * combinedVols[c];
                         fData[base + c] = val;
                         float absV = fabsf(val);
                         if (absV > maxPeak) maxPeak = absV;
@@ -2524,7 +2556,7 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
                 UINT32 base = i * channels;
                 for (UINT32 c = 0; c < channels; ++c)
                 {
-                    float fVal = static_cast<float>(p16[base + c]) * channelVolumes[c];
+                    float fVal = static_cast<float>(p16[base + c]) * combinedVols[c];
                     float absV = fabsf(fVal) * (1.0f / 32768.0f);
                     if (absV > maxPeak) maxPeak = absV;
                     if (absV > chPeaks[c]) chPeaks[c] = absV;
@@ -2565,7 +2597,7 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
                 UINT32 base = i * channels;
                 for (UINT32 c = 0; c < channels; ++c)
                 {
-                    float val = fData[base + c] * channelVolumes[c];
+                    float val = fData[base + c] * combinedVols[c];
                     fData[base + c] = val;
                     float absV = fabsf(val);
                     if (absV > maxPeak) maxPeak = absV;
