@@ -604,6 +604,10 @@ MyDeviceEnumerator::~MyDeviceEnumerator() {
         loopBuf = nullptr;
     }
 
+    delete[] m_loopFRawData;
+    delete[] m_loopFDestData;
+    delete[] m_tempWriteData;
+
     DeleteCriticalSection(&loopCS);
     DeleteCriticalSection(&volumeCS);
     if (loopEvent) CloseHandle(loopEvent);
@@ -960,19 +964,31 @@ void MyDeviceEnumerator::FeedLoopback(const BYTE* pData, UINT32 numFrames, const
     else
     {
         UINT32 srcSamples = numFrames * srcChannels;
-        if (m_loopFRaw.size() < srcSamples) m_loopFRaw.resize(srcSamples);
-        ConvertToFloat(pData, srcFmt, m_loopFRaw.data(), numFrames);
+        if (srcSamples > m_loopFRawCap) {
+            delete[] m_loopFRawData;
+            m_loopFRawCap = srcSamples * 2;
+            m_loopFRawData = new float[m_loopFRawCap];
+        }
+        ConvertToFloat(pData, srcFmt, m_loopFRawData, numFrames);
 
         UINT32 destSamples = destFrames * loopChannels;
-        if (m_loopFDest.size() < destSamples) m_loopFDest.resize(destSamples);
-        ResampleFloat(m_loopFRaw.data(), srcChannels, numFrames, m_loopFDest.data(), loopChannels, destFrames, ratio);
+        if (destSamples > m_loopFDestCap) {
+            delete[] m_loopFDestData;
+            m_loopFDestCap = destSamples * 2;
+            m_loopFDestData = new float[m_loopFDestCap];
+        }
+        ResampleFloat(m_loopFRawData, srcChannels, numFrames, m_loopFDestData, loopChannels, destFrames, ratio);
 
         UINT32 tempWriteSize = destFrames * loopFormat.Format.nBlockAlign;
-        if (m_tempWrite.size() < tempWriteSize) m_tempWrite.resize(tempWriteSize);
-        ConvertFromFloat(m_loopFDest.data(), loopFormat, m_tempWrite.data(), destFrames);
+        if (tempWriteSize > m_tempWriteCap) {
+            delete[] m_tempWriteData;
+            m_tempWriteCap = tempWriteSize * 2;
+            m_tempWriteData = new BYTE[m_tempWriteCap];
+        }
+        ConvertFromFloat(m_loopFDestData, loopFormat, m_tempWriteData, destFrames);
 
         bytesToWrite = tempWriteSize;
-        writeData = m_tempWrite.data();
+        writeData = m_tempWriteData;
     }
 
     UINT64 addedFrames = formatsMatch ? static_cast<UINT64>(numFrames) : static_cast<UINT64>(destFrames);
@@ -1279,6 +1295,8 @@ MyAudioClient::~MyAudioClient() {
         }
     }
 
+    delete[] m_applyTempData;
+
     InterlockedDecrement(&g_objects);
 }
 
@@ -1455,7 +1473,13 @@ HRESULT MyAudioClient::InternalInitialize(AUDCLNT_SHAREMODE ShareMode, DWORD Str
     }
 
     bufferBytes = dsBufferFrames * blockAlign;
-    m_applyTemp.resize(dsBufferFrames * format.Format.nChannels);
+    size_t needed = static_cast<size_t>(dsBufferFrames) * format.Format.nChannels;
+
+    if (needed > m_applyTempCap) {
+        delete[] m_applyTempData;
+        m_applyTempCap = needed * 2;
+        m_applyTempData = new float[m_applyTempCap];
+    }
 
     WAVEFORMATEXTENSIBLE dsFormatEx = {};
     if (pFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
@@ -1698,14 +1722,12 @@ HRESULT __stdcall MyAudioClient::GetCurrentPadding(UINT32* pNumPaddingFrames)
 HRESULT MyAudioClient::UpdatePositions(UINT32* padding) {
     if (padding == NULL) return E_POINTER;
 
-    if (rate == 0)
-    {
+    if (rate == 0) {
         *padding = 0;
         return S_OK;
     }
 
-    if (isLoopback)
-    {
+    if (isLoopback) {
         if (g_enumerator == nullptr) {
             *padding = 0; devicePositionFrames = 0;
             return AUDCLNT_E_DEVICE_INVALIDATED;
@@ -1753,60 +1775,52 @@ HRESULT MyAudioClient::UpdatePositions(UINT32* padding) {
     if (FAILED(hr))
         return hr;
 
-    if (!positionsInitialized)
-    {
+    if (!positionsInitialized) {
         prevPos = curPos;
         positionsInitialized = true;
     }
 
-    DWORD deltaBytes =
-        (curPos >= prevPos)
-        ? (curPos - prevPos)
-        : (bufferBytes - prevPos + curPos);
-
+    DWORD deltaBytes = (curPos >= prevPos) ? (curPos - prevPos) : (bufferBytes - prevPos + curPos);
     UINT32 deltaFrames = deltaBytes / blockAlign;
     devicePositionFrames += deltaFrames;
-
     prevPos = curPos;
+
     UINT32 dsBufferFrames = bufferBytes / blockAlign;
 
-    if (flow == eRender)
-    {
-        UINT32 writePosBytes = static_cast<UINT32>(lastPos % bufferBytes);
-        UINT32 queuedBytes = (writePosBytes >= curPos) ? (writePosBytes - curPos) : (bufferBytes - curPos + writePosBytes);
-        currentPaddingFrames = queuedBytes / blockAlign;
-
-        if (currentPaddingFrames > dsBufferFrames)
-            currentPaddingFrames = dsBufferFrames;
-
-        UINT64 playedFrames = devicePositionFrames;
-
-        if (totalWrittenFrames > playedFrames)
-        {
-            UINT64 remaining = totalWrittenFrames - playedFrames;
-            if (remaining < currentPaddingFrames)
-                currentPaddingFrames = static_cast<UINT32>(remaining);
-        }
-        else
-        {
+    if (flow == eRender) {
+        // Strict relative padding tracking
+        if (deltaFrames >= currentPaddingFrames) {
+            if (currentPaddingFrames > 0) {
+                // Underrun detected! Fill the entire buffer with silence to prevent DirectSound loop bug.
+                void* pData = NULL;
+                DWORD dataLen = 0;
+                if (SUCCEEDED(dsBuffer->Lock(0, 0, &pData, &dataLen, NULL, NULL, DSBLOCK_ENTIREBUFFER))) {
+                    BYTE silence = (format.Format.wBitsPerSample == 8) ? 128 : 0;
+                    memset(pData, IsFloatFormat(format) ? 0 : silence, dataLen);
+                    dsBuffer->Unlock(pData, dataLen, NULL, 0);
+                }
+            }
             currentPaddingFrames = 0;
         }
+        else {
+            currentPaddingFrames -= deltaFrames;
+        }
+
+        *padding = currentPaddingFrames;
     }
-    else
-    {
+    else {
+        // Capture tracking
         UINT32 readPosBytes = static_cast<UINT32>(lastPos % bufferBytes);
-        UINT32 availableBytes =
-            (curPos >= readPosBytes)
-            ? (curPos - readPosBytes)
-            : (bufferBytes - readPosBytes + curPos);
+        UINT32 availableBytes = (curPos >= readPosBytes) ? (curPos - readPosBytes) : (bufferBytes - readPosBytes + curPos);
 
         currentPaddingFrames = availableBytes / blockAlign;
 
         if (currentPaddingFrames > dsBufferFrames)
             currentPaddingFrames = dsBufferFrames;
+
+        *padding = currentPaddingFrames;
     }
 
-    *padding = currentPaddingFrames;
     return S_OK;
 }
 
@@ -2001,7 +2015,8 @@ HRESULT __stdcall MyAudioClient::Reset()
 {
     if (rate == 0) return AUDCLNT_E_NOT_INITIALIZED;
     if (started) return AUDCLNT_E_NOT_STOPPED;
-    Stop();
+
+    EnterCriticalSection(&cs);
 
     lastPos = 0ULL;
     currentPaddingFrames = 0;
@@ -2030,9 +2045,9 @@ HRESULT __stdcall MyAudioClient::Reset()
         FillSilence();
     }
 
+    LeaveCriticalSection(&cs);
     return S_OK;
 }
-
 
 HRESULT __stdcall MyAudioClient::SetEventHandle(HANDLE eventHandle) {
     if (rate == 0) return AUDCLNT_E_NOT_INITIALIZED;
@@ -2390,7 +2405,11 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
     bool isFloat = IsFloatFormat(format);
     UINT32 bits = format.Format.wBitsPerSample;
 
-    std::vector<float> combinedVols(channels, 1.0f);
+    if (m_combinedVols.size() < channels) m_combinedVols.resize(channels);
+    if (m_tempPeaks.size() < channels) m_tempPeaks.resize(channels);
+
+    float* combinedVols = m_combinedVols.data();
+    float* chPeaks = m_tempPeaks.data();
     bool allOne = true;
 
     if (isFloat)
@@ -2423,7 +2442,7 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
     }
 
     float maxPeak = 0.0f;
-    std::vector<float> chPeaks(channels, 0.0f);
+    std::fill(m_tempPeaks.begin(), m_tempPeaks.begin() + channels, 0.0f);
 
     if (isFloat)
     {
@@ -2659,8 +2678,12 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
     else
     {
         UINT32 samples = frames * channels;
-        if (samples > m_applyTemp.size()) m_applyTemp.resize(samples);
-        float* fData = m_applyTemp.data();
+        if (samples > m_applyTempCap) {
+            delete[] m_applyTempData;
+            m_applyTempCap = samples * 2;
+            m_applyTempData = new float[m_applyTempCap];
+        }
+        float* fData = m_applyTempData;
 
         ConvertToFloat(data, format, fData, frames);
 
@@ -2697,7 +2720,7 @@ void MyAudioClient::ApplyVolumes(BYTE* data, UINT32 frames)
     }
 
     m_peakValue = maxPeak;
-    m_channelPeakValues = std::move(chPeaks);
+    std::copy(m_tempPeaks.begin(), m_tempPeaks.begin() + channels, m_channelPeakValues.begin());
 }
 
 MyRenderClient::MyRenderClient(MyAudioClient* p)
@@ -2762,13 +2785,27 @@ HRESULT __stdcall MyRenderClient::GetBuffer(UINT32 NumFramesRequested, BYTE** pp
         return hr;
     }
 
-    //overflow protection
-    if (!parent->positionsInitialized || parent->totalWrittenFrames == 0)
+    UINT32 dsBufferFrames = parent->bufferBytes / parent->blockAlign;
+
+    // Underrun recovery: Snap lastPos to slightly ahead of the current play cursor
+    if (padding == 0 && parent->totalWrittenFrames > 0 && parent->started)
     {
-        padding = 0;
+        DWORD p1 = 0, p2 = 0;
+        if (SUCCEEDED(parent->dsBuffer->GetCurrentPosition(&p1, &p2)))
+        {
+            p1 -= (p1 % parent->blockAlign);
+            UINT32 curMod = static_cast<UINT32>(parent->lastPos % parent->bufferBytes);
+
+            // Advance lastPos forward to match p1 modulo
+            if (p1 >= curMod) parent->lastPos += (p1 - curMod);
+            else parent->lastPos += (parent->bufferBytes - curMod + p1);
+
+            // Add 20ms safe offset to avoid writing exactly where the hardware is reading
+            UINT32 safeOffsetFrames = (parent->rate / 50);
+            parent->lastPos += safeOffsetFrames * parent->blockAlign;
+        }
     }
 
-    UINT32 dsBufferFrames = parent->bufferBytes / parent->blockAlign;
     UINT32 availableFrames = (dsBufferFrames > padding) ? (dsBufferFrames - padding) : 0;
 
     if (NumFramesRequested > availableFrames)
@@ -2929,16 +2966,16 @@ MyCaptureClient::MyCaptureClient(MyAudioClient* p)
     CoCreateFreeThreadedMarshaler(static_cast<IUnknown*>(this), &m_pUnkMarshal);
     InterlockedIncrement(&g_objects);
     parent->NonDelegatingAddRef();
-
-    //Allocating memory for GetBuffer
-    m_loopRawBuf.reserve(32768);
-    m_loopFRaw.reserve(32768);
-    m_loopFDest.reserve(32768);
 }
 
 MyCaptureClient::~MyCaptureClient() {
     if (m_pUnkMarshal) m_pUnkMarshal->Release();
     delete[] tempBuffer;
+
+    delete[] m_loopRawBufData;
+    delete[] m_loopFRawData;
+    delete[] m_loopFDestData;
+
     parent->NonDelegatingRelease();
     InterlockedDecrement(&g_objects);
 }
@@ -3060,9 +3097,12 @@ HRESULT __stdcall MyCaptureClient::GetBuffer(BYTE** ppData, UINT32* pNumFramesTo
             return S_OK;
         }
 
-        if (m_loopRawBuf.size() < loopBytesToRead)
-            m_loopRawBuf.resize(loopBytesToRead);
-        BYTE* rawData = m_loopRawBuf.data();
+        if (loopBytesToRead > m_loopRawBufCap) {
+            delete[] m_loopRawBufData;
+            m_loopRawBufCap = loopBytesToRead * 2;
+            m_loopRawBufData = new BYTE[m_loopRawBufCap];
+        }
+        BYTE* rawData = m_loopRawBufData;
 
         UINT32 pos = static_cast<UINT32>(g_enumerator->loopReadPos % g_enumerator->loopBytes);
         UINT32 bytes1 = std::min(loopBytesToRead, g_enumerator->loopBytes - pos);
@@ -3071,16 +3111,22 @@ HRESULT __stdcall MyCaptureClient::GetBuffer(BYTE** ppData, UINT32* pNumFramesTo
             memcpy(rawData + bytes1, g_enumerator->loopBuf, loopBytesToRead - bytes1);
 
         UINT32 loopSamples = static_cast<UINT32>(loopPadFrames64) * loopChannels;
-        if (m_loopFRaw.size() < loopSamples)
-            m_loopFRaw.resize(loopSamples);
-        float* fRaw = m_loopFRaw.data();
+        if (loopSamples > m_loopFRawCap) {
+            delete[] m_loopFRawData;
+            m_loopFRawCap = loopSamples * 2;
+            m_loopFRawData = new float[m_loopFRawCap];
+        }
+        float* fRaw = m_loopFRawData;
 
         ConvertToFloat(rawData, g_enumerator->loopFormat, fRaw, static_cast<UINT32>(loopPadFrames64));
 
         UINT32 destSamples = frames * parentChannels;
-        if (m_loopFDest.size() < destSamples)
-            m_loopFDest.resize(destSamples);
-        float* fDest = m_loopFDest.data();
+        if (destSamples > m_loopFDestCap) {
+            delete[] m_loopFDestData;
+            m_loopFDestCap = destSamples * 2;
+            m_loopFDestData = new float[m_loopFDestCap];
+        }
+        float* fDest = m_loopFDestData;
 
         ResampleFloat(fRaw, loopChannels, static_cast<UINT32>(loopPadFrames64), fDest, parentChannels, frames, ratio);
 
