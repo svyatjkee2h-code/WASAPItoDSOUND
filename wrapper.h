@@ -134,9 +134,12 @@ private:
     vector<DeviceInfo> m_renderDevices;
     vector<DeviceInfo> m_captureDevices;
 
-    std::vector<float> m_loopFRaw;
-    std::vector<float> m_loopFDest;
-    std::vector<BYTE>  m_tempWrite;
+    float* m_loopFRawData = nullptr;
+    size_t m_loopFRawCap = 0;
+    float* m_loopFDestData = nullptr;
+    size_t m_loopFDestCap = 0;
+    BYTE* m_tempWriteData = nullptr;
+    size_t m_tempWriteCap = 0;
 
     void PopulateDeviceCaches();
 
@@ -266,7 +269,10 @@ private:
     GUID sessionGuid;
     MyAudioSession* session;
     vector<float> channelVolumes;
-    std::vector<float> m_applyTemp;
+    float* m_applyTempData = nullptr;
+    size_t m_applyTempCap = 0;
+    std::vector<float> m_combinedVols;
+    std::vector<float> m_tempPeaks;
     float m_peakValue;
     std::vector<float> m_channelPeakValues;
     void ApplyVolumes(BYTE* data, UINT32 frames);
@@ -328,9 +334,12 @@ private:
     MyAudioClient* parent;
     BYTE* tempBuffer;
     bool usingTemp;
-    vector<BYTE>  m_loopRawBuf;
-    vector<float> m_loopFRaw;
-    vector<float> m_loopFDest;
+    BYTE* m_loopRawBufData = nullptr;
+    size_t m_loopRawBufCap = 0;
+    float* m_loopFRawData = nullptr;
+    size_t m_loopFRawCap = 0;
+    float* m_loopFDestData = nullptr;
+    size_t m_loopFDestCap = 0;
 public:
     MyCaptureClient(MyAudioClient* p);
     ~MyCaptureClient();
